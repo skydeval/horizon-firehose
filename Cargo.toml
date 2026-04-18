@@ -1,0 +1,73 @@
+[package]
+name = "horizon-firehose"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Chrysanthemum Heart <chrys@chrysanthemum.dev>"]
+description = "A Rust-based ATProto firehose consumer with CBOR/CAR decoding, per-relay failover, and Redis stream publishing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/skydeval/horizon-firehose"
+readme = "README.md"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Config loading (TOML + env var overrides)
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Redis client
+redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+
+# Error handling
+thiserror = "2"
+
+# Base64 encoding for cursor keys
+base64 = "0.22"
+
+# TLS (rustls with system roots)
+rustls = "0.23"
+rustls-native-certs = "0.8"
+
+# proto-blue (pinned to commit SHA — see "Working with proto-blue" in README)
+proto-blue-api = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
+proto-blue-ws = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
+proto-blue-lex-cbor = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
+proto-blue-repo = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
+proto-blue-syntax = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
+
+[dev-dependencies]
+# Testing
+tokio-test = "0.4"
+
+# Property-based testing
+proptest = "1"
+
+# In-memory Redis for tests
+# (we'll figure out the right crate during phase 4 — options: `redis-test`, `mini-redis`, or a Docker harness)
+
+[[bin]]
+name = "horizon-firehose"
+path = "src/main.rs"
+
+[[bin]]
+name = "capture-fixtures"
+path = "src/bin/capture-fixtures.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+# Faster incremental builds during development
+opt-level = 0
+debug = true
