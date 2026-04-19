@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use proto_blue_ws::{WebSocketKeepAlive, WebSocketKeepAliveOpts};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -254,6 +254,9 @@ pub struct WsReader {
     /// preventing channel close during shutdown (`mpsc::WeakSender`
     /// doesn't count toward keep-alive).
     frames_weak: mpsc::WeakSender<Frame>,
+    /// Shared `Notify` so the decoder's circuit breaker can ask us
+    /// to drop the current connection. See [`WsReaderControl`].
+    force_reconnect: Arc<Notify>,
 }
 
 /// Cloneable accessor for ws_reader's supervisor state. Produced by
@@ -289,6 +292,34 @@ impl WsStateReader {
     }
 }
 
+/// Cloneable control handle for the ws_reader supervisor. Exposes
+/// `trigger_force_reconnect` so downstream tasks can ask the
+/// supervisor to drop the current connection and run its failover
+/// selection algorithm — used by the decoder's circuit breaker
+/// (Phase 8.5 review finding 3.4) when consecutive decode failures
+/// indicate the current relay is sending garbage.
+///
+/// Decoupled from `WsStateReader` because read access is a different
+/// capability from the ability to force a reconnect. Keeping them
+/// separate means tests that just want to observe don't accidentally
+/// get a trigger.
+#[derive(Clone)]
+pub struct WsReaderControl {
+    force_reconnect: Arc<Notify>,
+}
+
+impl WsReaderControl {
+    /// Ask the supervisor to abort the current connection and re-run
+    /// relay selection. The supervisor observes this in its inner
+    /// `select!` and treats it as if the connection dropped — the
+    /// failing relay's failure counter increments as normal, so
+    /// repeated forced reconnects will push it into cooldown and
+    /// promote a fallback.
+    pub fn trigger_force_reconnect(&self) {
+        self.force_reconnect.notify_waiters();
+    }
+}
+
 impl WsReader {
     /// Receive the next raw frame together with the relay URL it came
     /// from. Returns `None` once the supervisor has exited and the
@@ -318,6 +349,14 @@ impl WsReader {
     /// alive past the ws_reader's exit.
     pub fn frames_weak(&self) -> mpsc::WeakSender<Frame> {
         self.frames_weak.clone()
+    }
+
+    /// Control handle that can trigger a forced reconnect. Used by
+    /// the decoder's circuit breaker (Phase 8.5 review finding 3.4).
+    pub fn control(&self) -> WsReaderControl {
+        WsReaderControl {
+            force_reconnect: self.force_reconnect.clone(),
+        }
     }
 
     /// Signal shutdown (if the handle owns its shutdown sender) and
@@ -379,6 +418,7 @@ fn spawn_internal(
     let (frames_tx, frames_rx) = mpsc::channel(opts.frame_buffer);
     let frames_weak = frames_tx.downgrade();
     let state = Arc::new(Mutex::new(SharedState::from_config(&cfg)));
+    let force_reconnect = Arc::new(Notify::new());
     let task = tokio::spawn(supervisor(
         cfg,
         opts,
@@ -387,6 +427,7 @@ fn spawn_internal(
         state.clone(),
         cursors,
         metrics,
+        force_reconnect.clone(),
     ));
     WsReader {
         frames_rx,
@@ -394,9 +435,11 @@ fn spawn_internal(
         shutdown_tx,
         state,
         frames_weak,
+        force_reconnect,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn supervisor(
     cfg: RelayConfig,
     opts: WsReaderOptions,
@@ -405,6 +448,7 @@ async fn supervisor(
     state: Arc<Mutex<SharedState>>,
     cursors: Cursors,
     metrics: Arc<Metrics>,
+    force_reconnect: Arc<Notify>,
 ) {
     let initial_backoff = Duration::from_millis(cfg.reconnect_initial_delay_ms);
     let max_backoff = Duration::from_millis(cfg.reconnect_max_delay_ms);
@@ -462,6 +506,7 @@ async fn supervisor(
             &mut shutdown_rx,
             inner_max_secs,
             &metrics,
+            &force_reconnect,
         )
         .await;
 
@@ -509,6 +554,11 @@ enum ConnectionOutcome {
     ReadTimeout,
     CleanlyClosed,
     Error,
+    /// Decoder asked us to reconnect because consecutive decode
+    /// failures indicate garbage from this relay. Treated as a
+    /// failure for cooldown/failover purposes — repeated forces
+    /// push the relay into cooldown and promote a fallback.
+    ForcedReconnect,
 }
 
 /// Drive one WebSocket connection attempt. `connect_url` may include
@@ -526,8 +576,18 @@ async fn run_one_connection(
     shutdown_rx: &mut watch::Receiver<bool>,
     inner_max_secs: u64,
     metrics: &Metrics,
+    force_reconnect: &Notify,
 ) -> ConnectionOutcome {
-    info!(relay = %relay_label, connect_url = %connect_url, "connecting to relay");
+    // `connect_url` is `relay_label + ?cursor=N` — both components are
+    // userinfo-free (validator rejects userinfo-bearing relay URLs in
+    // config.rs, and the cursor is a numeric seq), so the log output
+    // carries no credentials. Sanitizer here is defense-in-depth per
+    // Phase 8.5 review finding 4.4.
+    info!(
+        relay = %crate::config::sanitize_ws_url(relay_label),
+        connect_url = %crate::config::sanitize_ws_url(connect_url),
+        "connecting to relay"
+    );
 
     let mut ws = WebSocketKeepAlive::new(
         connect_url,
@@ -577,6 +637,13 @@ async fn run_one_connection(
         let result = tokio::select! {
             biased;
             _ = shutdown_rx.changed() => return ConnectionOutcome::Shutdown,
+            _ = force_reconnect.notified() => {
+                info!(
+                    relay = %relay_label,
+                    "forced reconnect requested by downstream (decoder circuit breaker)"
+                );
+                return ConnectionOutcome::ForcedReconnect;
+            }
             r = tokio::time::timeout(opts.read_timeout, ws.recv()) => r,
         };
 

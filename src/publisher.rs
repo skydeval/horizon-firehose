@@ -53,6 +53,28 @@ use crate::cursor::Cursors;
 use crate::event::Event;
 use crate::metrics::Metrics;
 
+/// In-band pipeline message — the single item type on every channel
+/// between decoder / router / publisher. Phase 8.5 review finding 1.1:
+/// previously the decoder advanced the shared in-memory cursor
+/// directly whenever a `#sync` frame arrived. That moved the cursor
+/// past buffered commits still in flight, violating the DESIGN.md §3
+/// "cursor = last XADDed seq" invariant and silently losing events
+/// on hard crashes or graceful-shutdown-with-Redis-down. The fix:
+/// route skip-advances as an in-band [`PublishOp::Skip`] through the
+/// same channel that carries events. The publisher — already the
+/// XADD-success-advances-cursor writer — becomes the *sole* cursor
+/// writer, so advance ordering matches XADD ordering by construction.
+#[derive(Debug)]
+pub enum PublishOp {
+    /// Publish `event` to Redis, advance the cursor on XADD success.
+    Publish(Event, u64),
+    /// Advance the cursor without publishing anything. Used for
+    /// frames the decoder classified as `Skipped` (e.g. `#sync`) —
+    /// they advance the firehose position but have no Redis
+    /// representation.
+    Skip { relay: String, seq: u64 },
+}
+
 #[derive(Debug, Clone)]
 pub struct PublisherOptions {
     pub stream_key: String,
@@ -107,6 +129,10 @@ pub struct PublisherStats {
     pub events_oversize_skipped: u64,
     pub redis_errors: u64,
     pub total_retry_wait: Duration,
+    /// Phase 8.5 review finding 1.1: `PublishOp::Skip` ops processed.
+    /// These advanced the cursor without XADDing anything — e.g.
+    /// `#sync` frames the decoder forwarded.
+    pub skip_advances: u64,
 }
 
 /// Handle to the spawned publisher task.
@@ -155,7 +181,7 @@ pub fn spawn<B: StreamBackend>(
     backend: Arc<B>,
     cursors: Cursors,
     opts: PublisherOptions,
-    input: mpsc::Receiver<(Event, u64)>,
+    input: mpsc::Receiver<PublishOp>,
     metrics: Arc<Metrics>,
 ) -> PublisherHandle {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -167,7 +193,7 @@ pub async fn run<B: StreamBackend>(
     backend: Arc<B>,
     cursors: Cursors,
     opts: PublisherOptions,
-    mut input: mpsc::Receiver<(Event, u64)>,
+    mut input: mpsc::Receiver<PublishOp>,
     mut shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<Metrics>,
 ) -> Result<PublisherStats, PublisherError> {
@@ -182,10 +208,10 @@ pub async fn run<B: StreamBackend>(
         // tests can rely on `drop(tx); handle.shutdown()` publishing
         // every queued event before exiting. Mid-retry shutdown is a
         // separate concern, handled inside `xadd_with_retry` below.
-        let (event, seq) = tokio::select! {
+        let op = tokio::select! {
             biased;
             recv = input.recv() => match recv {
-                Some(pair) => pair,
+                Some(op) => op,
                 None => {
                     debug!(?stats, "publisher: input channel closed");
                     break;
@@ -194,6 +220,19 @@ pub async fn run<B: StreamBackend>(
             _ = shutdown_rx.changed() => {
                 debug!(?stats, "publisher: shutdown signalled with empty channel");
                 break;
+            }
+        };
+        let (event, seq) = match op {
+            PublishOp::Publish(ev, seq) => (ev, seq),
+            // Skip-advance in-band: process in channel order, so a
+            // commit queued before a `#sync` is guaranteed to have
+            // been XADDed (or skipped with oversize) before we touch
+            // the cursor for the sync. The publisher is now the sole
+            // writer to the in-memory cursor.
+            PublishOp::Skip { relay, seq } => {
+                cursors.advance(&relay, seq).await;
+                stats.skip_advances += 1;
+                continue;
             }
         };
         stats.events_in += 1;
@@ -435,8 +474,12 @@ mod tests {
             m(),
         );
 
-        tx.send((tiny_commit(1), 100)).await.unwrap();
-        tx.send((tiny_commit(2), 101)).await.unwrap();
+        tx.send(PublishOp::Publish(tiny_commit(1), 100))
+            .await
+            .unwrap();
+        tx.send(PublishOp::Publish(tiny_commit(2), 101))
+            .await
+            .unwrap();
         drop(tx);
 
         let stats = timeout(Duration::from_secs(2), handle.join())
@@ -463,7 +506,9 @@ mod tests {
         );
 
         for i in 0..20u64 {
-            tx.send((tiny_commit(i), 1000 + i)).await.unwrap();
+            tx.send(PublishOp::Publish(tiny_commit(i), 1000 + i))
+                .await
+                .unwrap();
         }
         drop(tx);
 
@@ -488,8 +533,12 @@ mod tests {
             m(),
         );
 
-        tx.send((tiny_commit(1), 50)).await.unwrap();
-        tx.send((tiny_commit(2), 51)).await.unwrap();
+        tx.send(PublishOp::Publish(tiny_commit(1), 50))
+            .await
+            .unwrap();
+        tx.send(PublishOp::Publish(tiny_commit(2), 51))
+            .await
+            .unwrap();
         drop(tx);
 
         let stats = handle.join().await.unwrap();
@@ -513,7 +562,9 @@ mod tests {
             rx,
             m(),
         );
-        tx.send((tiny_commit(1), 50)).await.unwrap();
+        tx.send(PublishOp::Publish(tiny_commit(1), 50))
+            .await
+            .unwrap();
         // drop(tx) unnecessary — task returns Err before reading more.
 
         let result = timeout(Duration::from_secs(2), handle.join())
@@ -543,7 +594,9 @@ mod tests {
             rx,
             m(),
         );
-        tx.send((tiny_commit(1), 77)).await.unwrap();
+        tx.send(PublishOp::Publish(tiny_commit(1), 77))
+            .await
+            .unwrap();
         drop(tx);
 
         let stats = timeout(Duration::from_secs(5), handle.join())
@@ -579,7 +632,9 @@ mod tests {
             rx,
             m(),
         );
-        tx.send((tiny_commit(1), 9999)).await.unwrap();
+        tx.send(PublishOp::Publish(tiny_commit(1), 9999))
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -611,7 +666,7 @@ mod tests {
             handle: Some("alice.test".into()),
             relay: RELAY.into(),
         });
-        tx.send((id_ev, 42)).await.unwrap();
+        tx.send(PublishOp::Publish(id_ev, 42)).await.unwrap();
         drop(tx);
 
         handle.join().await.unwrap();
@@ -627,5 +682,145 @@ mod tests {
             .map(|(_, v)| v.clone())
             .unwrap();
         assert_eq!(type_field, b"identity");
+    }
+
+    // ─── Phase 8.5: finding 1.1 — SkipAdvance timing invariant ────
+
+    #[tokio::test]
+    async fn skip_op_advances_cursor_without_xadd() {
+        // Phase 8.5 finding 1.1: `PublishOp::Skip` advances the
+        // cursor the same way a published event would, but writes
+        // nothing to the stream.
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        let (tx, rx) = mpsc::channel(4);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            opts(1000, 1 << 20, OversizePolicy::SkipWithLog),
+            rx,
+            m(),
+        );
+
+        tx.send(PublishOp::Skip {
+            relay: RELAY.to_string(),
+            seq: 77,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.events_published, 0);
+        assert_eq!(stats.skip_advances, 1);
+        assert_eq!(c.get(RELAY).await, Some(77));
+        assert_eq!(b.xlen("firehose:events").await.unwrap(), 0);
+    }
+
+    /// The load-bearing test for Phase 8.5 review finding 1.1. The
+    /// DESIGN.md §3 invariant — "cursor = last successfully XADDed
+    /// seq" — held only if the publisher is the sole cursor writer.
+    /// We verify that invariant in the presence of interleaved
+    /// commit / skip / commit frames AND a blocked backend: the
+    /// cursor must never move past a seq whose predecessor is still
+    /// pending XADD.
+    #[tokio::test]
+    async fn skip_never_advances_cursor_past_pending_commits() {
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        // Block every XADD. The publisher will enter its retry
+        // loop on the first commit and never drain the channel.
+        b.set_fail_mode(FailMode::FailNext(10_000)).await;
+
+        let (tx, rx) = mpsc::channel::<PublishOp>(16);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            PublisherOptions {
+                retry_initial: Duration::from_millis(5),
+                retry_max: Duration::from_millis(20),
+                ..opts(1000, 1 << 20, OversizePolicy::SkipWithLog)
+            },
+            rx,
+            m(),
+        );
+
+        // Queue commit@100, skip@101, commit@102.
+        tx.send(PublishOp::Publish(tiny_commit(1), 100))
+            .await
+            .unwrap();
+        tx.send(PublishOp::Skip {
+            relay: RELAY.to_string(),
+            seq: 101,
+        })
+        .await
+        .unwrap();
+        tx.send(PublishOp::Publish(tiny_commit(2), 102))
+            .await
+            .unwrap();
+
+        // Give the publisher time to pick up commit@100 and start
+        // retrying.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // Cursor must still be None. The pre-fix bug was: decoder
+        // advanced to 101 on skip even though commit@100 hadn't
+        // been XADDed yet. Now the skip is behind @100 in the
+        // channel and the publisher processes in order.
+        assert_eq!(
+            c.get(RELAY).await,
+            None,
+            "cursor advanced past pending commit — \
+             Phase 8.5 review finding 1.1 regression"
+        );
+
+        // Force shutdown; the task exits with commit@100 unpublished.
+        let stats = handle.shutdown().await.unwrap();
+        assert_eq!(stats.events_published, 0);
+        assert_eq!(
+            stats.skip_advances, 0,
+            "publisher must not have processed the skip while blocked on 100"
+        );
+        assert_eq!(c.get(RELAY).await, None);
+    }
+
+    #[tokio::test]
+    async fn skip_advances_cursor_in_channel_order_after_commit_succeeds() {
+        // Mirror of the test above, but with a healthy backend.
+        // commit@100 → skip@101 → commit@102 all process; the final
+        // cursor must be 102, and intermediate observations must
+        // show the cursor advancing monotonically through 100, 101,
+        // 102 (i.e. the skip is processed between the commits, not
+        // before).
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        let (tx, rx) = mpsc::channel::<PublishOp>(16);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            opts(1000, 1 << 20, OversizePolicy::SkipWithLog),
+            rx,
+            m(),
+        );
+
+        tx.send(PublishOp::Publish(tiny_commit(1), 100))
+            .await
+            .unwrap();
+        tx.send(PublishOp::Skip {
+            relay: RELAY.to_string(),
+            seq: 101,
+        })
+        .await
+        .unwrap();
+        tx.send(PublishOp::Publish(tiny_commit(2), 102))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.events_published, 2);
+        assert_eq!(stats.skip_advances, 1);
+        assert_eq!(c.get(RELAY).await, Some(102));
+        assert_eq!(b.xlen("firehose:events").await.unwrap(), 2);
     }
 }

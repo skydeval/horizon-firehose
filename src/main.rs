@@ -164,13 +164,51 @@ fn validate_tls_extra_ca(cfg: &Config) -> Result<(), Error> {
     }
 }
 
+/// Phase 8.5 review finding 4.5: build the concrete, copy-pasteable
+/// remediation block for a malformed cursor at startup. Factored
+/// here so the test suite can assert on its contents — 3am ops
+/// regressions where "operator didn't see a DEL command" are a
+/// silent-failure shape we want to guard against.
+pub(crate) fn malformed_cursor_remediation(relay: &str, key: &str, value: &str) -> String {
+    format!(
+        "\n  \
+         relay:             {relay}\n  \
+         cursor key:        {key}\n  \
+         malformed value:   {value:?}\n\n\
+         Refusing to resume from live tip — that would silently lose every event\n\
+         between the corrupted seq and current live tip. Operator action required.\n\n\
+         Options (pick one, then restart):\n\
+         \n  \
+         1. Inspect the raw value yourself:\n       \
+            redis-cli -u \"$REDIS_URL\" GET {key}\n\n  \
+         2. Repair the cursor to a specific seq N you trust:\n       \
+            redis-cli -u \"$REDIS_URL\" SET {key} N\n\n  \
+         3. Delete the key to resume from live tip DELIBERATELY\n     \
+            (accepts the loss of events between the corrupt seq and live tip):\n       \
+            redis-cli -u \"$REDIS_URL\" DEL {key}\n"
+    )
+}
+
 pub(crate) fn emit_startup_metrics(cfg: &Config, path: &std::path::Path) {
+    // Phase 8.5 review finding 4.4: belt-and-suspenders sanitization.
+    // Config-level validation already rejects userinfo-bearing relay
+    // URLs (see config::validate_ws_url), so these `sanitize_ws_url`
+    // calls are redundant in the steady state — but cheap, and cover
+    // any future validation regression before the leak reaches
+    // persisted stream entries or log aggregation pipelines.
+    let primary = crate::config::sanitize_ws_url(&cfg.relay.url);
+    let fallbacks: Vec<String> = cfg
+        .relay
+        .fallbacks
+        .iter()
+        .map(|u| crate::config::sanitize_ws_url(u))
+        .collect();
     let payload = json!({
         "type": "startup_metrics",
         "config_version": cfg.config_version,
         "consumer_version": CONSUMER_VERSION,
-        "relay_primary": cfg.relay.url,
-        "relay_fallbacks": cfg.relay.fallbacks,
+        "relay_primary": primary,
+        "relay_fallbacks": fallbacks,
         "redis_url_host": cfg.redis_url_host(),
         "max_stream_len": cfg.redis.max_stream_len,
         "filter_nsid_count": cfg.filter.record_types.len(),
@@ -225,7 +263,35 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
         .collect();
     let cursors = Cursors::new();
     if let Err(err) = cursors.load_initial(backend.as_ref(), &all_relays).await {
-        warn!(error = %err, "failed to load cursors at startup; resuming from live tip");
+        // Phase 8.5 review finding 4.5: distinguish "cursor value was
+        // malformed" (corruption or typo in Redis — hard fail for
+        // operator to fix) from "Redis transiently unreachable" (log
+        // + resume from live tip, which is the documented §3
+        // behaviour for "no prior cursor").
+        match &err {
+            backend::BackendError::MalformedCursor { key, value } => {
+                let relay_for_key = all_relays
+                    .iter()
+                    .find(|r| cursor::cursor_key(r) == *key)
+                    .cloned()
+                    .unwrap_or_else(|| "<unknown — key didn't match any configured relay>".into());
+                let remediation = malformed_cursor_remediation(&relay_for_key, key, value);
+                error!(
+                    relay = %relay_for_key,
+                    cursor_key = %key,
+                    malformed_value = %value,
+                    "{}",
+                    remediation
+                );
+                return Err(Error::TaskFailure {
+                    task: "cursor_startup",
+                    message: err.to_string(),
+                });
+            }
+            _ => {
+                warn!(error = %err, "failed to load cursors at startup; resuming from live tip");
+            }
+        }
     }
 
     // Shared metrics. Every task that produces counters holds an
@@ -236,8 +302,10 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
 
     // Channels between pipeline stages. All bounded — backpressure
     // cascades upstream to the relay if a downstream stage stalls.
-    let (event_tx, event_rx) = mpsc::channel::<(event::Event, u64)>(CHANNEL_BUFFER);
-    let (filtered_tx, filtered_rx) = mpsc::channel::<(event::Event, u64)>(CHANNEL_BUFFER);
+    // Channel item type is `PublishOp` end-to-end so skip-advances
+    // flow in-band (Phase 8.5 review finding 1.1).
+    let (event_tx, event_rx) = mpsc::channel::<publisher::PublishOp>(CHANNEL_BUFFER);
+    let (filtered_tx, filtered_rx) = mpsc::channel::<publisher::PublishOp>(CHANNEL_BUFFER);
     // Downgrade the producer sides so the metrics emitter can sample
     // channel depth without keeping the channel alive past the
     // producer's exit — see metrics::ChannelGauges docs for why.
@@ -253,12 +321,14 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
         shutdown_rx.clone(),
         metrics.clone(),
     );
-    // Capture the ws → decoder WeakSender and the state reader
-    // *before* `ws_reader` is moved into `decoder::spawn`.
+    // Capture the ws → decoder WeakSender, state reader, and
+    // control handle *before* `ws_reader` is moved into
+    // `decoder::spawn`.
     let ws_to_decoder_weak = ws_reader.frames_weak();
     let ws_state = ws_reader.state_reader();
+    let ws_control = ws_reader.control();
 
-    let mut decoder_handle = decoder::spawn(ws_reader, cursors.clone(), event_tx, metrics.clone());
+    let mut decoder_handle = decoder::spawn(ws_reader, event_tx, metrics.clone(), ws_control);
 
     let mut router_handle = router::spawn(
         router::RouterOptions {
@@ -306,7 +376,7 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
     info!(
         target: "horizon_firehose::metrics",
         event_type = "pipeline_started",
-        relay_primary = %cfg.relay.url,
+        relay_primary = %crate::config::sanitize_ws_url(&cfg.relay.url),
         channel_buffer = CHANNEL_BUFFER,
         "pipeline running"
     );

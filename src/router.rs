@@ -31,6 +31,7 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::event::{CommitEvent, Event};
+use crate::publisher::PublishOp;
 
 /// Outcome of filtering a single event. No `PartialEq` — `Event`
 /// contains `serde_json::Value` (records) which isn't `Eq` (it can hold
@@ -112,8 +113,10 @@ impl RouterHandle {
     }
 }
 
-/// Spawn the router task. Reads `(Event, seq)` pairs from `input`,
-/// applies the filter, forwards survivors to `output`.
+/// Spawn the router task. Reads [`PublishOp`]s from `input`, applies
+/// the filter to the event variant, and forwards survivors to
+/// `output`. Skip-advance ops pass through unchanged — they're not
+/// record-bearing (Phase 8.5 review finding 1.1).
 ///
 /// The task exits when:
 /// - `input` closes (decoder has exited and drained) — the normal
@@ -123,8 +126,8 @@ impl RouterHandle {
 ///   continuing.
 pub fn spawn(
     opts: RouterOptions,
-    mut input: mpsc::Receiver<(Event, u64)>,
-    output: mpsc::Sender<(Event, u64)>,
+    mut input: mpsc::Receiver<PublishOp>,
+    output: mpsc::Sender<PublishOp>,
 ) -> RouterHandle {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let filter: HashSet<String> = opts.record_types.into_iter().collect();
@@ -139,22 +142,33 @@ pub fn spawn(
             tokio::select! {
                 biased;
                 recv = input.recv() => {
-                    let Some((event, seq)) = recv else {
+                    let Some(op) = recv else {
                         debug!(?stats, "router: input channel closed");
                         break;
                     };
                     stats.events_in += 1;
-                    match filter_event(event, &filter) {
-                        FilterOutcome::Pass(ev) => {
-                            if output.send((ev, seq)).await.is_err() {
-                                debug!("router: output channel closed");
-                                break;
+                    let forwarded = match op {
+                        // Skip-advance passes through untouched; it
+                        // carries no record body to filter on.
+                        PublishOp::Skip { .. } => Some(op),
+                        PublishOp::Publish(event, seq) => {
+                            match filter_event(event, &filter) {
+                                FilterOutcome::Pass(ev) => {
+                                    Some(PublishOp::Publish(ev, seq))
+                                }
+                                FilterOutcome::Drop => {
+                                    stats.events_dropped += 1;
+                                    None
+                                }
                             }
-                            stats.events_out += 1;
                         }
-                        FilterOutcome::Drop => {
-                            stats.events_dropped += 1;
+                    };
+                    if let Some(op) = forwarded {
+                        if output.send(op).await.is_err() {
+                            debug!("router: output channel closed");
+                            break;
                         }
+                        stats.events_out += 1;
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -334,8 +348,8 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_forwards_only_surviving_events() {
-        let (in_tx, in_rx) = mpsc::channel::<(Event, u64)>(16);
-        let (out_tx, mut out_rx) = mpsc::channel::<(Event, u64)>(16);
+        let (in_tx, in_rx) = mpsc::channel::<PublishOp>(16);
+        let (out_tx, mut out_rx) = mpsc::channel::<PublishOp>(16);
 
         let handle = spawn(
             RouterOptions {
@@ -348,21 +362,21 @@ mod tests {
         // Send 3 events: one passes, one drops (wrong type), one is
         // identity (always passes).
         in_tx
-            .send((
+            .send(PublishOp::Publish(
                 commit(vec![op_with_type("app.bsky.feed.post", "create")]),
                 1,
             ))
             .await
             .unwrap();
         in_tx
-            .send((
+            .send(PublishOp::Publish(
                 commit(vec![op_with_type("app.bsky.feed.like", "create")]),
                 2,
             ))
             .await
             .unwrap();
         in_tx
-            .send((
+            .send(PublishOp::Publish(
                 Event::Identity(IdentityEvent {
                     did: "did:plc:x".into(),
                     handle: None,
@@ -377,8 +391,10 @@ mod tests {
         drop(in_tx);
 
         let mut seqs = Vec::new();
-        while let Some((_ev, seq)) = out_rx.recv().await {
-            seqs.push(seq);
+        while let Some(op) = out_rx.recv().await {
+            if let PublishOp::Publish(_, seq) = op {
+                seqs.push(seq);
+            }
         }
         assert_eq!(seqs, vec![1, 3]);
 

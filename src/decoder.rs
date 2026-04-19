@@ -31,14 +31,14 @@ use proto_blue_repo::read_car;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::cursor::Cursors;
 use crate::event::{
     AccountEvent, CommitEvent, Event, HandleEvent, IdentityEvent, Operation, TombstoneEvent,
 };
 use crate::metrics::Metrics;
-use crate::ws_reader::WsReader;
+use crate::publisher::PublishOp;
+use crate::ws_reader::{WsReader, WsReaderControl};
 
 /// Top-level result of decoding one binary frame.
 #[derive(Debug)]
@@ -104,10 +104,77 @@ pub enum DecodeError {
         #[source]
         source: Box<DecodeError>,
     },
+
+    /// Phase 8.5 review finding 3.2: frame exceeds the ATProto spec's
+    /// 5MB ceiling. tungstenite accepts up to its 64MB default and
+    /// proto-blue-ws doesn't plumb through a `WebSocketConfig`
+    /// override (tracking: proto-blue#5), so we backstop at the
+    /// decoder to cap peak memory during decode.
+    #[error("frame size {size} bytes exceeds AT-spec maximum {max} bytes")]
+    FrameTooLarge { size: usize, max: usize },
+
+    /// Phase 8.5 review finding 3.1: a preflight byte-scan walks
+    /// the CBOR nesting depth without decoding; anything deeper than
+    /// `MAX_PREFLIGHT_DEPTH` is rejected before allocation begins.
+    /// A hostile frame at depth > this would otherwise stack-overflow
+    /// one of three recursive decoders (ciborium, cbor_to_lex,
+    /// lex_to_json), aborting the process via SIGABRT.
+    #[error("frame exceeds maximum CBOR nesting depth: depth {depth} > max {max}")]
+    FrameTooDeep { depth: u32, max: u32 },
+
+    /// Defense-in-depth twin for `FrameTooDeep`: the preflight scan is
+    /// the primary shield, but `lex_to_json` also carries a depth
+    /// argument so a future regression in the scanner (or a legitimate
+    /// but deep record that somehow slips past) can't recurse without
+    /// bound.
+    #[error("record exceeds maximum JSON nesting depth at depth {depth}")]
+    RecordTooDeep { depth: u32 },
+
+    /// The preflight scanner found a byte sequence that isn't
+    /// well-formed DAG-CBOR (reserved info bits, indefinite-length
+    /// item where DAG-CBOR requires definite length, etc.). Returned
+    /// as a decode error rather than a decoder panic.
+    #[error("malformed CBOR in preflight scan: {0}")]
+    MalformedCbor(&'static str),
 }
+
+/// Phase 8.5 review finding 3.2: ATProto firehose spec hard maximum.
+/// tungstenite's default `max_message_size` is 64 MiB, and
+/// proto-blue-ws doesn't plumb through a `WebSocketConfig` override
+/// yet (tracking: proto-blue#5). We backstop in the decoder so a
+/// hostile or misbehaving relay can't expand a 64MB frame into
+/// several hundred MB of in-memory CBOR + LexValue + JSON trees.
+pub const MAX_FRAME_BYTES: usize = 5 * 1024 * 1024;
+
+/// Phase 8.5 review finding 3.1: CBOR nesting depth cap. ATProto
+/// records in the wild rarely exceed depth 8–12; 64 is generous. The
+/// preflight scanner ([`preflight_scan`]) walks the byte stream and
+/// rejects frames deeper than this before any recursive decoder is
+/// called.
+pub const MAX_PREFLIGHT_DEPTH: u32 = 64;
+
+/// Defense-in-depth twin of `MAX_PREFLIGHT_DEPTH`: applied inside
+/// [`lex_to_json`] so a regression in the preflight scanner — or a
+/// deeply-nested LexValue produced some other way — can't recurse
+/// without bound. Matched value, different enforcement layer.
+pub const MAX_JSON_DEPTH: u32 = 64;
 
 /// Decode one binary firehose frame.
 pub fn decode_frame(bytes: &[u8], relay: &str) -> Result<DecodedFrame, DecodeError> {
+    // Phase 8.5 review finding 3.2: cheap byte-length gate before
+    // anything allocates.
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(DecodeError::FrameTooLarge {
+            size: bytes.len(),
+            max: MAX_FRAME_BYTES,
+        });
+    }
+    // Phase 8.5 review finding 3.1: depth preflight. Walks CBOR
+    // length prefixes iteratively without building a tree; rejects
+    // deeply-nested frames before any recursive decoder touches
+    // them.
+    preflight_scan(bytes, MAX_PREFLIGHT_DEPTH)?;
+
     let values = decode_all(bytes)?;
     if values.len() < 2 {
         return Err(DecodeError::TruncatedFrame { got: values.len() });
@@ -208,7 +275,10 @@ fn decode_commit(
                 path: path.clone(),
                 source: Box::new(DecodeError::Cbor(e)),
             })?;
-            Some(lex_to_json(&lex))
+            Some(lex_to_json(&lex).map_err(|e| DecodeError::RecordDecode {
+                path: path.clone(),
+                source: Box::new(e),
+            })?)
         } else {
             // create/update without a CID is malformed per spec but we
             // shouldn't panic — emit a null record and let downstream
@@ -315,24 +385,193 @@ fn map_seq(body: &BTreeMap<String, LexValue>) -> Result<u64, DecodeError> {
 /// values pass through as-is — we never reject — so deployments that
 /// index custom lexicons keep their data (DESIGN.md §3 "Unknown
 /// `$type` values").
-pub(crate) fn lex_to_json(v: &LexValue) -> serde_json::Value {
+///
+/// Depth-bounded per Phase 8.5 review finding 3.1 — the preflight
+/// scan is the primary defense, this is backup.
+pub(crate) fn lex_to_json(v: &LexValue) -> Result<serde_json::Value, DecodeError> {
+    lex_to_json_bounded(v, 0)
+}
+
+fn lex_to_json_bounded(v: &LexValue, depth: u32) -> Result<serde_json::Value, DecodeError> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(DecodeError::RecordTooDeep { depth });
+    }
     use serde_json::Value as J;
-    match v {
+    Ok(match v {
         LexValue::Null => J::Null,
         LexValue::Bool(b) => J::Bool(*b),
         LexValue::Integer(i) => J::Number((*i).into()),
         LexValue::String(s) => J::String(s.clone()),
         LexValue::Bytes(b) => J::String(bytes_hex(b)),
         LexValue::Cid(c) => J::String(c.to_string()),
-        LexValue::Array(arr) => J::Array(arr.iter().map(lex_to_json).collect()),
+        LexValue::Array(arr) => J::Array(
+            arr.iter()
+                .map(|x| lex_to_json_bounded(x, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
         LexValue::Map(m) => {
             let mut obj = serde_json::Map::with_capacity(m.len());
             for (k, v) in m {
-                obj.insert(k.clone(), lex_to_json(v));
+                obj.insert(k.clone(), lex_to_json_bounded(v, depth + 1)?);
             }
             J::Object(obj)
         }
+    })
+}
+
+/// Walk DAG-CBOR bytes iteratively, tracking the maximum nesting
+/// depth reached. Returns `Err` if any container opens at a depth
+/// exceeding `max_depth`. Does not allocate a tree — uses an
+/// explicit `Vec<u64>` of remaining-items-per-level (bounded at
+/// `max_depth + 2`).
+///
+/// DAG-CBOR is definite-length only (no indefinite-length containers)
+/// so every map/array declares its child count in the length prefix.
+/// That makes a non-recursive walk straightforward: push the child
+/// count on entry, decrement on each completed child, pop when zero.
+///
+/// # What it doesn't catch
+///
+/// - Malformed CBOR that ciborium would later reject. We pass-through;
+///   the primary decoder still runs and surfaces those errors.
+/// - Byte-length truncation at the end of the frame. Same reasoning:
+///   decode_all sees it, we don't try to double-validate.
+pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeError> {
+    // Stack: remaining items at each nesting level, outermost first.
+    // The top-level of a firehose frame is two items (header + body).
+    let mut stack: Vec<u64> = Vec::with_capacity(16);
+    stack.push(2);
+
+    let mut pos = 0usize;
+    // Max observed depth for error reporting.
+    let mut max_observed: u32 = 0;
+
+    while let Some(&top) = stack.last() {
+        // If the innermost container is complete, pop upward until we
+        // find one that still has pending items (or empty the stack).
+        if top == 0 {
+            stack.pop();
+            if let Some(parent) = stack.last_mut() {
+                *parent = parent.saturating_sub(1);
+            }
+            continue;
+        }
+
+        if pos >= bytes.len() {
+            // Ran out of bytes mid-structure. Let `decode_all` in the
+            // main path report truncation with its own error; the
+            // preflight's job is depth enforcement, not completeness.
+            return Ok(());
+        }
+
+        // Reject depth beyond the cap *before* opening a new container.
+        // The stack length includes the top-level slot (= 1) plus one
+        // entry per container. So `stack.len() - 1` is the current
+        // container depth.
+        let depth_now = (stack.len() - 1) as u32;
+        if depth_now > max_depth {
+            return Err(DecodeError::FrameTooDeep {
+                depth: depth_now,
+                max: max_depth,
+            });
+        }
+        max_observed = max_observed.max(depth_now);
+
+        let initial = bytes[pos];
+        pos += 1;
+        let major = initial >> 5;
+        let info = initial & 0x1F;
+
+        let arg: u64 = match info {
+            0..=23 => info as u64,
+            24 => {
+                if pos >= bytes.len() {
+                    return Ok(());
+                }
+                let v = bytes[pos] as u64;
+                pos += 1;
+                v
+            }
+            25 => {
+                if pos + 2 > bytes.len() {
+                    return Ok(());
+                }
+                let v = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as u64;
+                pos += 2;
+                v
+            }
+            26 => {
+                if pos + 4 > bytes.len() {
+                    return Ok(());
+                }
+                let v = u32::from_be_bytes([
+                    bytes[pos],
+                    bytes[pos + 1],
+                    bytes[pos + 2],
+                    bytes[pos + 3],
+                ]) as u64;
+                pos += 4;
+                v
+            }
+            27 => {
+                if pos + 8 > bytes.len() {
+                    return Ok(());
+                }
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&bytes[pos..pos + 8]);
+                let v = u64::from_be_bytes(buf);
+                pos += 8;
+                v
+            }
+            28..=30 => {
+                return Err(DecodeError::MalformedCbor("reserved additional-info bits"));
+            }
+            31 => {
+                // Indefinite-length container: not allowed in DAG-CBOR.
+                return Err(DecodeError::MalformedCbor(
+                    "indefinite-length item (DAG-CBOR is definite-only)",
+                ));
+            }
+            _ => unreachable!("info is 5 bits"),
+        };
+
+        match major {
+            0 | 1 | 7 => {
+                // Integer / simple / float — fully-consumed scalar.
+                *stack.last_mut().unwrap() = stack.last().unwrap().saturating_sub(1);
+            }
+            2 | 3 => {
+                // Bytes / text string — skip `arg` content bytes.
+                pos = pos.saturating_add(arg as usize);
+                *stack.last_mut().unwrap() = stack.last().unwrap().saturating_sub(1);
+            }
+            4 => {
+                // Array of `arg` items.
+                if arg == 0 {
+                    *stack.last_mut().unwrap() = stack.last().unwrap().saturating_sub(1);
+                } else {
+                    stack.push(arg);
+                }
+            }
+            5 => {
+                // Map of `arg` pairs = 2 * arg items.
+                if arg == 0 {
+                    *stack.last_mut().unwrap() = stack.last().unwrap().saturating_sub(1);
+                } else {
+                    stack.push(arg.saturating_mul(2));
+                }
+            }
+            6 => {
+                // Tag: the next item is the tagged value and counts as
+                // the same item in the parent, so don't decrement here.
+                // (Tag + tagged-value together = one item.)
+            }
+            _ => unreachable!("major is 3 bits"),
+        }
     }
+
+    let _ = max_observed;
+    Ok(())
 }
 
 fn bytes_hex(b: &[u8]) -> String {
@@ -473,6 +712,13 @@ fn lex_kind(v: &LexValue) -> &'static str {
 
 // ─── Phase 5 pipeline task ─────────────────────────────────────────
 
+/// Phase 8.5 review finding 3.4: K consecutive decode failures before
+/// the circuit breaker trips and asks ws_reader to force a failover.
+/// Chosen low enough that a single malformed relay is penalised
+/// quickly; high enough that transient network glitches don't cause
+/// oscillation.
+pub const DECODER_CIRCUIT_THRESHOLD: u32 = 10;
+
 /// Counters collected by the decoder task, emitted when the task exits.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DecoderStats {
@@ -482,6 +728,14 @@ pub struct DecoderStats {
     pub skipped_frames: u64,
     pub info_frames: u64,
     pub outdated_cursors: u64,
+    /// Phase 8.5 review finding 3.5: decode panics caught by the
+    /// task's `catch_unwind` wrapper. Stack overflows are SIGABRT
+    /// and not counted here (not catchable); everything else that
+    /// went wrong in the three-crate decoder chain is.
+    pub decoder_panics: u64,
+    /// Phase 8.5 review finding 3.4: times the consecutive-error
+    /// threshold was reached and we asked for a forced failover.
+    pub circuit_opens: u64,
 }
 
 /// Handle to a spawned decoder task.
@@ -499,47 +753,130 @@ impl DecoderHandle {
     }
 }
 
-/// Spawn the decoder task. It pulls `(bytes, relay)` pairs from the
-/// `WsReader`, runs [`decode_frame`], and forwards republishable
-/// events downstream as `(Event, seq)`. Decode errors are counted and
-/// logged at WARN; `#sync` and other `Skipped` frames still advance
-/// the per-relay cursor even though nothing goes downstream — so
-/// long idle gaps on `#sync`-heavy relays don't stall restart
-/// replay. `OutdatedCursor` and other `#info` frames are currently
-/// logged and counted; acting on them (per-config) lands in a later
-/// phase.
+/// Spawn the decoder task. Pulls `(bytes, relay)` frames from the
+/// `WsReader`, runs [`decode_frame`] (wrapped in `catch_unwind` per
+/// finding 3.5), and forwards republishable events — and skip
+/// advances for `#sync` frames — to the publisher as
+/// [`PublishOp`]s. The publisher is the sole writer to the
+/// in-memory cursor; the decoder no longer touches it directly
+/// (Phase 8.5 review finding 1.1).
+///
+/// Decode errors and caught panics are logged at WARN/ERROR with a
+/// short hex prefix of the offending frame. After
+/// `DECODER_CIRCUIT_THRESHOLD` consecutive failures the decoder
+/// signals `ws_reader` to force a failover (finding 3.4); the
+/// counter resets on the next successful decode.
 pub fn spawn(
     mut reader: WsReader,
-    cursors: Cursors,
-    event_tx: mpsc::Sender<(Event, u64)>,
+    event_tx: mpsc::Sender<PublishOp>,
     metrics: Arc<Metrics>,
+    control: WsReaderControl,
 ) -> DecoderHandle {
     let task = tokio::spawn(async move {
         let mut stats = DecoderStats::default();
+        let mut consecutive_errors: u32 = 0;
 
         while let Some((bytes, relay)) = reader.recv().await {
             stats.frames_in += 1;
 
-            match decode_frame(&bytes, &relay) {
-                Ok(DecodedFrame::Event { event, seq }) => {
-                    if event_tx.send((event, seq)).await.is_err() {
+            // Phase 8.5 review finding 3.5: `catch_unwind` stops
+            // panics from killing the decoder task. Rust stack
+            // overflows are SIGABRT (not unwinding), so this covers
+            // arithmetic panics, slice OOB, and unwraps in deps —
+            // not the stack-overflow attack (which is blocked by
+            // the preflight-depth scan in `decode_frame` itself).
+            let decode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode_frame(&bytes, &relay)
+            }));
+
+            let frame = match decode_result {
+                Ok(Ok(frame)) => {
+                    consecutive_errors = 0;
+                    frame
+                }
+                Ok(Err(e)) => {
+                    stats.decode_errors += 1;
+                    metrics.decode_errors_total.fetch_add(1, Ordering::Relaxed);
+                    if matches!(e, DecodeError::UnknownFrameType(_)) {
+                        metrics
+                            .unknown_frame_types_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    let hex_prefix = hex_prefix(&bytes, 32);
+                    warn!(
+                        relay = %relay,
+                        error = %e,
+                        frame_hex_prefix = %hex_prefix,
+                        "CBOR/CAR decode failed; dropping frame"
+                    );
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    maybe_trip_circuit(
+                        &mut consecutive_errors,
+                        &mut stats,
+                        &metrics,
+                        &control,
+                        &relay,
+                    );
+                    continue;
+                }
+                Err(payload) => {
+                    stats.decoder_panics += 1;
+                    metrics.decoder_panics_total.fetch_add(1, Ordering::Relaxed);
+                    // Panic payloads are `Box<dyn Any + Send>` — try
+                    // to extract a string message, fall back to a
+                    // generic note. Either way we don't re-raise.
+                    let msg = panic_payload_str(&payload);
+                    let hex_prefix = hex_prefix(&bytes, 32);
+                    error!(
+                        relay = %relay,
+                        panic_message = %msg,
+                        frame_hex_prefix = %hex_prefix,
+                        "decoder panicked on frame (isolated); dropping and continuing"
+                    );
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    maybe_trip_circuit(
+                        &mut consecutive_errors,
+                        &mut stats,
+                        &metrics,
+                        &control,
+                        &relay,
+                    );
+                    continue;
+                }
+            };
+
+            match frame {
+                DecodedFrame::Event { event, seq } => {
+                    if event_tx.send(PublishOp::Publish(event, seq)).await.is_err() {
                         debug!("decoder: downstream channel closed");
                         break;
                     }
                     stats.events_out += 1;
                 }
-                Ok(DecodedFrame::Skipped { kind, seq }) => {
+                DecodedFrame::Skipped { kind, seq } => {
                     stats.skipped_frames += 1;
                     metrics.skipped_frames_total.fetch_add(1, Ordering::Relaxed);
-                    // Advance the cursor past the skipped frame so
-                    // replay after restart doesn't re-see it forever.
-                    // The §3 "republish to Redis" invariant is about
-                    // event-bearing frames; skipped frames by design
-                    // have no downstream entry.
-                    cursors.advance(&relay, seq).await;
-                    debug!(kind, seq, relay = %relay, "skipped frame; cursor advanced");
+                    // Phase 8.5 review finding 1.1: send an in-band
+                    // skip-advance through the pipeline instead of
+                    // advancing the shared cursor directly. The
+                    // publisher processes this in channel order, so
+                    // commits queued before a `#sync` are guaranteed
+                    // to XADD (or be oversize-skipped) before the
+                    // cursor moves past the `#sync` seq.
+                    if event_tx
+                        .send(PublishOp::Skip {
+                            relay: relay.clone(),
+                            seq,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        debug!("decoder: downstream channel closed");
+                        break;
+                    }
+                    debug!(kind, seq, relay = %relay, "skipped frame; forwarded as PublishOp::Skip");
                 }
-                Ok(DecodedFrame::OutdatedCursor { message }) => {
+                DecodedFrame::OutdatedCursor { message } => {
                     stats.outdated_cursors += 1;
                     warn!(
                         relay = %relay,
@@ -547,37 +884,13 @@ pub fn spawn(
                         "received OutdatedCursor from relay (policy handling is phase-next)",
                     );
                 }
-                Ok(DecodedFrame::Info { name, message }) => {
+                DecodedFrame::Info { name, message } => {
                     stats.info_frames += 1;
                     info!(
                         relay = %relay,
                         info_name = %name,
                         message = ?message,
                         "relay info frame"
-                    );
-                }
-                Err(e) => {
-                    stats.decode_errors += 1;
-                    metrics.decode_errors_total.fetch_add(1, Ordering::Relaxed);
-                    // `UnknownFrameType` is a distinct bucket (DESIGN.md
-                    // §3 "Frame types: handled vs known-skip vs
-                    // unknown") — count separately so operators can
-                    // alert on "ATProto added a frame type" without
-                    // alert fatigue from every corrupted CBOR frame.
-                    if matches!(e, DecodeError::UnknownFrameType(_)) {
-                        metrics
-                            .unknown_frame_types_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    // Log with a short hex prefix of the frame so an
-                    // operator can correlate with a capture — without
-                    // flooding the log with full frame bodies.
-                    let hex_prefix = hex_prefix(&bytes, 32);
-                    warn!(
-                        relay = %relay,
-                        error = %e,
-                        frame_hex_prefix = %hex_prefix,
-                        "CBOR/CAR decode failed; dropping frame"
                     );
                 }
             }
@@ -598,6 +911,50 @@ fn hex_prefix(b: &[u8], n: usize) -> String {
         let _ = write!(s, "{byte:02x}");
     }
     s
+}
+
+/// Best-effort string extraction from a `catch_unwind` panic payload.
+/// Rust panics commonly carry either `&'static str` or `String`; for
+/// anything else we emit a generic marker.
+fn panic_payload_str(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<panic payload not representable as str>".to_string()
+    }
+}
+
+/// Phase 8.5 review finding 3.4: if we've seen
+/// `DECODER_CIRCUIT_THRESHOLD` failures in a row, ask the supervisor
+/// to drop the current connection and re-run relay selection.
+/// Resets the counter so the next failure starts a new window —
+/// otherwise a persistently broken relay would trigger the force on
+/// every single frame after the first K.
+fn maybe_trip_circuit(
+    consecutive: &mut u32,
+    stats: &mut DecoderStats,
+    metrics: &Metrics,
+    control: &WsReaderControl,
+    relay: &str,
+) {
+    if *consecutive >= DECODER_CIRCUIT_THRESHOLD {
+        stats.circuit_opens += 1;
+        metrics
+            .decoder_circuit_opens_total
+            .fetch_add(1, Ordering::Relaxed);
+        error!(
+            target: "horizon_firehose::metrics",
+            event_type = "decoder_circuit_open",
+            relay = %relay,
+            consecutive_errors = *consecutive,
+            threshold = DECODER_CIRCUIT_THRESHOLD,
+            "decoder consecutive-error threshold reached; requesting relay failover"
+        );
+        control.trigger_force_reconnect();
+        *consecutive = 0;
+    }
 }
 
 #[cfg(test)]
@@ -631,7 +988,7 @@ mod tests {
             m.insert("nested".into(), LexValue::Map(inner));
             m
         });
-        let j = lex_to_json(&v);
+        let j = lex_to_json(&v).unwrap();
         assert!(j["null"].is_null());
         assert_eq!(j["bool"], serde_json::Value::Bool(true));
         assert_eq!(j["int"], serde_json::json!(-5));
@@ -639,6 +996,113 @@ mod tests {
         assert_eq!(j["bytes"], "dead");
         assert_eq!(j["arr"][0], 1);
         assert_eq!(j["nested"]["k"], "v");
+    }
+
+    // ─── Phase 8.5 adversarial fixtures for preflight scan ─────────
+    // Hand-crafted CBOR bytes rather than committed .cbor files:
+    // easier to read at the point of use, no fixture-directory churn.
+
+    /// Build `depth` nested maps each with one key pointing to the
+    /// next. Terminates with a null at the bottom. `{"a": {"a": {...}}}`.
+    /// Encodes as: `a1 61 61 …` repeated `depth` times, then `f6`.
+    fn nested_maps(depth: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(depth as usize * 3 + 1);
+        for _ in 0..depth {
+            out.push(0xA1); // map of 1 pair
+            out.push(0x61); // text string, len 1
+            out.push(b'a');
+        }
+        out.push(0xF6); // null (terminating value)
+        out
+    }
+
+    /// Build a firehose-like frame: header `{op:1, t:"#identity"}`
+    /// then body (the supplied payload). Two top-level items.
+    fn frame_with_body(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        // Header: map of 2 pairs
+        out.push(0xA2);
+        out.extend_from_slice(&[0x62, b'o', b'p']); // key "op"
+        out.push(0x01); // value 1
+        out.extend_from_slice(&[0x61, b't']); // key "t"
+        out.push(0x69); // text string, len 9
+        out.extend_from_slice(b"#identity");
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn preflight_accepts_shallow_frame() {
+        let body = nested_maps(10);
+        let frame = frame_with_body(&body);
+        assert!(preflight_scan(&frame, MAX_PREFLIGHT_DEPTH).is_ok());
+    }
+
+    #[test]
+    fn preflight_rejects_deeply_nested_frame() {
+        let body = nested_maps(128);
+        let frame = frame_with_body(&body);
+        let err = preflight_scan(&frame, MAX_PREFLIGHT_DEPTH).unwrap_err();
+        match err {
+            DecodeError::FrameTooDeep { depth, max } => {
+                assert!(depth > max, "reported depth {depth} should exceed {max}");
+                assert_eq!(max, MAX_PREFLIGHT_DEPTH);
+            }
+            other => panic!("expected FrameTooDeep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_indefinite_length_container() {
+        // DAG-CBOR disallows indefinite-length items; 0x9F is one.
+        let body = vec![0x9F, 0x01, 0xFF];
+        let frame = frame_with_body(&body);
+        let err = preflight_scan(&frame, MAX_PREFLIGHT_DEPTH).unwrap_err();
+        assert!(matches!(err, DecodeError::MalformedCbor(_)));
+    }
+
+    #[test]
+    fn decode_frame_rejects_oversize_before_scan() {
+        let bytes = vec![0u8; 6 * 1024 * 1024];
+        let err = decode_frame(&bytes, "ws://t").unwrap_err();
+        match err {
+            DecodeError::FrameTooLarge { size, max } => {
+                assert_eq!(size, 6 * 1024 * 1024);
+                assert_eq!(max, MAX_FRAME_BYTES);
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_frame_rejects_deep_nesting_before_recursive_decoders() {
+        // Phase 8.5 finding 3.1 attack: a 1000-deep frame would
+        // stack-overflow the CBOR → LexValue → JSON recursion
+        // absent the preflight, but is well below the 5 MB size
+        // gate.
+        let body = nested_maps(1000);
+        let frame = frame_with_body(&body);
+        let err = decode_frame(&frame, "ws://t").unwrap_err();
+        assert!(
+            matches!(err, DecodeError::FrameTooDeep { .. }),
+            "expected FrameTooDeep, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn lex_to_json_rejects_overly_deep_lex_tree() {
+        fn nested_lex_map(depth: u32) -> LexValue {
+            if depth == 0 {
+                LexValue::Null
+            } else {
+                let mut m = BTreeMap::new();
+                m.insert("a".to_string(), nested_lex_map(depth - 1));
+                LexValue::Map(m)
+            }
+        }
+        let deep = nested_lex_map(MAX_JSON_DEPTH + 10);
+        let err = lex_to_json(&deep).unwrap_err();
+        assert!(matches!(err, DecodeError::RecordTooDeep { .. }));
     }
 
     /// End-to-end: decode every captured fixture, gather stats.

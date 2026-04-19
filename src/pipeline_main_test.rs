@@ -31,7 +31,7 @@ use crate::cursor::{Cursors, cursor_key, spawn_persister};
 use crate::decoder;
 use crate::event::Event;
 use crate::metrics::Metrics;
-use crate::publisher::{self, PublisherOptions};
+use crate::publisher::{self, PublishOp, PublisherOptions};
 use crate::router::{self, RouterOptions};
 use crate::ws_reader::{self, WsReaderOptions};
 
@@ -127,8 +127,8 @@ async fn end_to_end_pipeline_delivers_event_to_backend() {
     let cursors = Cursors::new();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let (event_tx, event_rx) = mpsc::channel::<(Event, u64)>(128);
-    let (filtered_tx, filtered_rx) = mpsc::channel::<(Event, u64)>(128);
+    let (event_tx, event_rx) = mpsc::channel::<PublishOp>(128);
+    let (filtered_tx, filtered_rx) = mpsc::channel::<PublishOp>(128);
 
     let ws_reader = ws_reader::spawn_with_cursors(
         relay_cfg(url.clone()),
@@ -137,7 +137,8 @@ async fn end_to_end_pipeline_delivers_event_to_backend() {
         shutdown_rx.clone(),
         Metrics::new(),
     );
-    let decoder_h = decoder::spawn(ws_reader, cursors.clone(), event_tx, Metrics::new());
+    let ws_control = ws_reader.control();
+    let decoder_h = decoder::spawn(ws_reader, event_tx, Metrics::new(), ws_control);
     let router_h = router::spawn(
         RouterOptions {
             record_types: vec![],
@@ -195,8 +196,8 @@ async fn shutdown_cascade_finalises_cursor_within_budget() {
     let cursors = Cursors::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let (event_tx, event_rx) = mpsc::channel::<(Event, u64)>(128);
-    let (filtered_tx, filtered_rx) = mpsc::channel::<(Event, u64)>(128);
+    let (event_tx, event_rx) = mpsc::channel::<PublishOp>(128);
+    let (filtered_tx, filtered_rx) = mpsc::channel::<PublishOp>(128);
 
     let ws_reader = ws_reader::spawn_with_cursors(
         relay_cfg(url.clone()),
@@ -205,7 +206,8 @@ async fn shutdown_cascade_finalises_cursor_within_budget() {
         shutdown_rx.clone(),
         Metrics::new(),
     );
-    let decoder_h = decoder::spawn(ws_reader, cursors.clone(), event_tx, Metrics::new());
+    let ws_control = ws_reader.control();
+    let decoder_h = decoder::spawn(ws_reader, event_tx, Metrics::new(), ws_control);
     let router_h = router::spawn(
         RouterOptions {
             record_types: vec![],
@@ -315,8 +317,8 @@ async fn pipeline_initializes_even_when_backend_is_failing_then_shuts_down() {
     let cursors = Cursors::new();
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
-    let (event_tx, event_rx) = mpsc::channel::<(Event, u64)>(32);
-    let (filtered_tx, filtered_rx) = mpsc::channel::<(Event, u64)>(32);
+    let (event_tx, event_rx) = mpsc::channel::<PublishOp>(32);
+    let (filtered_tx, filtered_rx) = mpsc::channel::<PublishOp>(32);
 
     // No ws_reader/decoder in this test — we stuff events in
     // directly. What we're testing is the publisher-with-broken-backend
@@ -342,7 +344,7 @@ async fn pipeline_initializes_even_when_backend_is_failing_then_shuts_down() {
         did: "did:plc:abc".into(),
         relay: "ws://test".into(),
     });
-    event_tx.send((ev, 42)).await.unwrap();
+    event_tx.send(PublishOp::Publish(ev, 42)).await.unwrap();
     drop(event_tx);
 
     // Let the retry loop engage.
@@ -464,8 +466,8 @@ async fn periodic_metrics_emits_with_expected_fields() {
     // Fake ws_state + channel gauges so the emitter has something to
     // sample. The emitter does not actually care whether the channels
     // ever had traffic — only that upgrade() returns Some(Sender).
-    let (e_tx, _e_rx) = mpsc::channel::<(Event, u64)>(16);
-    let (f_tx, _f_rx) = mpsc::channel::<(Event, u64)>(16);
+    let (e_tx, _e_rx) = mpsc::channel::<PublishOp>(16);
+    let (f_tx, _f_rx) = mpsc::channel::<PublishOp>(16);
     let (w_tx, _w_rx) = mpsc::channel::<crate::ws_reader::Frame>(16);
     let gauges = crate::metrics::ChannelGauges {
         ws_to_decoder: w_tx.downgrade(),
@@ -576,8 +578,8 @@ async fn cursor_ages_seconds_is_per_relay_object_not_scalar() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     cursors.advance("wss://fallback.test/xrpc/sub", 7).await;
 
-    let (e_tx, _e_rx) = mpsc::channel::<(Event, u64)>(16);
-    let (f_tx, _f_rx) = mpsc::channel::<(Event, u64)>(16);
+    let (e_tx, _e_rx) = mpsc::channel::<PublishOp>(16);
+    let (f_tx, _f_rx) = mpsc::channel::<PublishOp>(16);
     let (w_tx, _w_rx) = mpsc::channel::<crate::ws_reader::Frame>(16);
     let gauges = crate::metrics::ChannelGauges {
         ws_to_decoder: w_tx.downgrade(),
@@ -653,8 +655,8 @@ async fn periodic_metrics_delta_captures_increments_between_ticks() {
     let metrics = Metrics::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let (e_tx, _e_rx) = mpsc::channel::<(Event, u64)>(16);
-    let (f_tx, _f_rx) = mpsc::channel::<(Event, u64)>(16);
+    let (e_tx, _e_rx) = mpsc::channel::<PublishOp>(16);
+    let (f_tx, _f_rx) = mpsc::channel::<PublishOp>(16);
     let (w_tx, _w_rx) = mpsc::channel::<crate::ws_reader::Frame>(16);
     let gauges = crate::metrics::ChannelGauges {
         ws_to_decoder: w_tx.downgrade(),
@@ -712,6 +714,85 @@ async fn periodic_metrics_delta_captures_increments_between_ticks() {
     // assertion to "total adds up and ordering monotonic".
     let sum: u64 = deltas.iter().sum();
     assert_eq!(sum, 30, "deltas must cover the full 30-count increment");
+}
+
+#[test]
+fn malformed_cursor_remediation_includes_everything_an_operator_needs() {
+    // Phase 8.5 review finding 4.5: at 3am an operator debugging
+    // a failed startup should see, in a single log block:
+    //   - which relay this cursor belongs to
+    //   - the exact Redis key to operate on
+    //   - the malformed value that tripped the parse
+    //   - a copy-pasteable remediation (three options, inspect /
+    //     repair / delete, using the actual key — not `{key}`)
+    //
+    // This test pins the message contents so a future refactor
+    // that accidentally drops a field or re-interpolates `{key}`
+    // wrong fails loudly.
+    let relay = "wss://relay.fyi/xrpc/com.atproto.sync.subscribeRepos";
+    let key =
+        "firehose:cursor:d3NzOi8vcmVsYXkuZnlpL3hycGMvY29tLmF0cHJvdG8uc3luYy5zdWJzY3JpYmVSZXBvcw";
+    let value = "not-a-u64";
+    let msg = crate::malformed_cursor_remediation(relay, key, value);
+
+    // Every concrete value must appear in the message.
+    assert!(msg.contains(relay), "relay URL missing: {msg}");
+    assert!(msg.contains(key), "cursor key missing: {msg}");
+    assert!(msg.contains(value), "malformed value missing: {msg}");
+
+    // All three `redis-cli` remediation commands must be present
+    // with the *actual* key substituted in — not a literal `{key}`
+    // placeholder.
+    assert!(
+        msg.contains(&format!("redis-cli -u \"$REDIS_URL\" GET {key}")),
+        "GET command missing or has un-interpolated placeholder: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("redis-cli -u \"$REDIS_URL\" SET {key} N")),
+        "SET command missing or has un-interpolated placeholder: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("redis-cli -u \"$REDIS_URL\" DEL {key}")),
+        "DEL command missing or has un-interpolated placeholder: {msg}"
+    );
+    // The "{" character can only appear from `{value:?}` Debug quoting;
+    // any literal un-interpolated `{key}` or `{value}` would fail this.
+    assert!(
+        !msg.contains("{key}"),
+        "literal `{{key}}` slipped through un-interpolated: {msg}"
+    );
+    assert!(
+        !msg.contains("{value}"),
+        "literal `{{value}}` slipped through un-interpolated: {msg}"
+    );
+
+    // Must explicitly state that resuming from live tip silently
+    // loses events — so the operator understands why we're failing
+    // startup rather than warning and continuing.
+    assert!(
+        msg.to_lowercase().contains("silently lose")
+            || msg.to_lowercase().contains("silently loses"),
+        "missing loss-of-events explanation: {msg}"
+    );
+}
+
+#[test]
+fn malformed_cursor_remediation_labels_unknown_relay_clearly() {
+    // When the key doesn't match any configured relay (e.g. a
+    // stale cursor for a relay removed from config), the function
+    // is invoked with a `<unknown — …>` placeholder from main.rs.
+    // Verify it passes through into the message.
+    let msg = crate::malformed_cursor_remediation(
+        "<unknown — key didn't match any configured relay>",
+        "firehose:cursor:deadbeef",
+        "garbage",
+    );
+    assert!(
+        msg.contains("<unknown"),
+        "unknown-relay label missing: {msg}"
+    );
+    assert!(msg.contains("firehose:cursor:deadbeef"));
+    assert!(msg.contains("redis-cli -u \"$REDIS_URL\" DEL firehose:cursor:deadbeef"));
 }
 
 #[tokio::test]
@@ -808,8 +889,8 @@ async fn emitter_exits_promptly_on_shutdown_signal() {
     let metrics = Metrics::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let (e_tx, _e_rx) = mpsc::channel::<(Event, u64)>(16);
-    let (f_tx, _f_rx) = mpsc::channel::<(Event, u64)>(16);
+    let (e_tx, _e_rx) = mpsc::channel::<PublishOp>(16);
+    let (f_tx, _f_rx) = mpsc::channel::<PublishOp>(16);
     let (w_tx, _w_rx) = mpsc::channel::<crate::ws_reader::Frame>(16);
     let gauges = crate::metrics::ChannelGauges {
         ws_to_decoder: w_tx.downgrade(),

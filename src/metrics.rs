@@ -88,6 +88,19 @@ pub struct Metrics {
     /// truth.
     pub reconnects_total: AtomicU64,
 
+    /// Phase 8.5 review finding 3.5: counts panics the decoder task
+    /// caught via `std::panic::catch_unwind`. Stack overflows are
+    /// not catchable (SIGABRT), so this counts everything *else*
+    /// that went wrong during decode: arithmetic panics, slice
+    /// out-of-bounds, unexpected unwraps in dependencies.
+    pub decoder_panics_total: AtomicU64,
+
+    /// Phase 8.5 review finding 3.4: times the decoder's consecutive
+    /// error threshold was reached and it asked the supervisor for a
+    /// failover. Proxy for "relay is sending garbage" — alert on any
+    /// sustained increase.
+    pub decoder_circuit_opens_total: AtomicU64,
+
     /// Rolling reconnect history (for the `reconnects_last_hour`
     /// gauge) owned by the metrics struct. Written by ws_reader on
     /// each reconnect, read by the emitter on each tick. Capped at
@@ -186,8 +199,8 @@ impl CumulativeSnapshot {
 #[derive(Clone)]
 pub struct ChannelGauges {
     pub ws_to_decoder: mpsc::WeakSender<crate::ws_reader::Frame>,
-    pub decoder_to_router: mpsc::WeakSender<(crate::event::Event, u64)>,
-    pub router_to_publisher: mpsc::WeakSender<(crate::event::Event, u64)>,
+    pub decoder_to_router: mpsc::WeakSender<crate::publisher::PublishOp>,
+    pub router_to_publisher: mpsc::WeakSender<crate::publisher::PublishOp>,
 }
 
 impl ChannelGauges {

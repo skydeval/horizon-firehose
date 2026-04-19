@@ -275,7 +275,64 @@ fn validate_ws_url(field: &str, url: &str) -> Result<()> {
             "{field} ({url:?}) must start with ws:// or wss://"
         )));
     }
+    // Phase 8.5 review finding 4.4 + 4.9: userinfo in the relay URL
+    // (`wss://user:pass@host/…`) would land in every startup_metrics
+    // log and every event's `_relay` field. Reject at config time —
+    // ATProto firehose doesn't use URL-based auth in the first place,
+    // so a userinfo-bearing URL is always a misconfiguration.
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = after_scheme
+        .split(&['/', '?', '#'][..])
+        .next()
+        .unwrap_or("");
+    if authority.contains('@') {
+        return Err(Error::ConfigValidation(format!(
+            "{field} contains userinfo (`user@host` or `user:pass@host`); \
+             ATProto relays don't use URL-based auth and committing credentials \
+             to logs / event payloads is a leak risk. Remove the userinfo portion.",
+        )));
+    }
+    // Phase 8.5 review finding 4.1: the comment previously claimed the
+    // validator rejects pre-existing `cursor=` query params; it didn't.
+    // Reject them now so the `?cursor=N` appended by ws_reader can't
+    // produce a double-cursor URL with undefined relay behaviour.
+    let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    for param in query.split('&') {
+        let name = param.split_once('=').map(|(n, _)| n).unwrap_or(param);
+        if name.eq_ignore_ascii_case("cursor") {
+            return Err(Error::ConfigValidation(format!(
+                "{field} has a pre-existing `cursor=` query parameter — \
+                 ws_reader appends its own `?cursor=N` on reconnect and would \
+                 produce a double-cursor URL. Remove it from config; cursors \
+                 are managed at runtime.",
+            )));
+        }
+    }
     Ok(())
+}
+
+/// Strip userinfo from a `ws://` or `wss://` URL, preserving scheme +
+/// host + port + path + query. Used everywhere a relay URL might land
+/// in a log, a metric, or an event payload. Mirrors
+/// [`sanitize_redis_host`] but keeps the path/query intact since the
+/// XRPC endpoint and query params are part of the relay's identity
+/// (cursor-key hashing, `_relay` event field, and the
+/// `connect_url` log on reconnect all need them).
+pub fn sanitize_ws_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some(at) = rest.rfind('@') else {
+        return url.to_string();
+    };
+    // Userinfo only counts if the `@` is in the authority section —
+    // i.e. before the first `/`, `?`, or `#`. An `@` inside a path
+    // is legal and should be preserved.
+    let first_path_char = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if at >= first_path_char {
+        return url.to_string();
+    }
+    format!("{scheme}://{}", &rest[at + 1..])
 }
 
 fn validate_redis_url(field: &str, url: &str) -> Result<()> {
@@ -616,6 +673,80 @@ max_stream_len = 500000
             assert!(matches!(err, Error::ConfigLoad { .. }));
             Ok(())
         });
+    }
+
+    #[test]
+    fn rejects_userinfo_in_relay_url() {
+        // Phase 8.5 review finding 4.4: userinfo would land in every
+        // startup_metrics log and every event's `_relay` field.
+        Jail::expect_with(|jail| {
+            let body = MINIMAL_CONFIG.replace(
+                "url = \"wss://bsky.network\"",
+                "url = \"wss://user:pass@bsky.network\"",
+            );
+            let path = write_config(jail, &body);
+            let err = Config::load(&path).unwrap_err();
+            match err {
+                Error::ConfigValidation(msg) => {
+                    assert!(
+                        msg.contains("userinfo"),
+                        "want userinfo mention; got: {msg}"
+                    );
+                }
+                other => panic!("expected ConfigValidation, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_userinfo_in_relay_fallback_url() {
+        Jail::expect_with(|jail| {
+            let body = MINIMAL_CONFIG.replace(
+                "[relay]\nurl = \"wss://bsky.network\"",
+                "[relay]\nurl = \"wss://bsky.network\"\nfallbacks = [\"wss://u@fb\"]",
+            );
+            let path = write_config(jail, &body);
+            let err = Config::load(&path).unwrap_err();
+            assert!(matches!(err, Error::ConfigValidation(s) if s.contains("userinfo")));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_preexisting_cursor_query_param_in_relay_url() {
+        // Phase 8.5 review finding 4.1: ws_reader appends `?cursor=N`
+        // on reconnect; a pre-existing cursor param would produce a
+        // double-cursor URL.
+        Jail::expect_with(|jail| {
+            let body = MINIMAL_CONFIG.replace(
+                "url = \"wss://bsky.network\"",
+                "url = \"wss://bsky.network/xrpc/sub?cursor=0\"",
+            );
+            let path = write_config(jail, &body);
+            let err = Config::load(&path).unwrap_err();
+            assert!(matches!(err, Error::ConfigValidation(s) if s.contains("cursor=")));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn sanitize_ws_url_strips_userinfo_keeps_path_and_query() {
+        assert_eq!(
+            sanitize_ws_url("wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos"),
+            "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos"
+        );
+        assert_eq!(
+            sanitize_ws_url("wss://user:pass@host.example/xrpc/sub?x=1"),
+            "wss://host.example/xrpc/sub?x=1"
+        );
+        assert_eq!(sanitize_ws_url("ws://u@host:9443/"), "ws://host:9443/");
+        // `@` inside the path must NOT trip the sanitizer — path
+        // `@` is legal per RFC 3986.
+        assert_eq!(
+            sanitize_ws_url("wss://host.example/path/with/@sign"),
+            "wss://host.example/path/with/@sign"
+        );
     }
 
     #[test]

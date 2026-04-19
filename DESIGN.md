@@ -118,11 +118,19 @@ The service runs four concurrent tokio tasks:
 
 2. **Decoder task.** Pulls raw frames from the channel, decodes them using proto-blue's CBOR/CAR crates, extracts operations, filters by configured record types, and pushes typed events to a second bounded channel.
 
-3. **Publisher task.** Pulls typed events from the decoder channel, serializes to JSON (matching the §4 schema), XADDs to the Redis stream, and advances the cursor tracker **only on confirmed Redis success**.
+3. **Publisher task.** Pulls typed events from the decoder channel, serializes to JSON (matching the §4 schema), XADDs to the Redis stream, and advances the cursor tracker **only on confirmed Redis success**. It is also the **sole writer** to the in-memory cursor — see "Cursor ownership" below.
 
 4. **Cursor persister task.** Wakes every 5 seconds, reads the current cursor from the in-memory tracker, and writes it to Redis (`firehose:cursor:{base64url(relay_url)}`). Also runs once during graceful shutdown.
 
 Bounded channels provide backpressure. Cursor advancement tied to XADD success ensures no gaps on task panic.
+
+### cursor ownership — publisher is the sole writer
+
+An earlier draft let the decoder advance the in-memory cursor directly whenever a `#sync` frame arrived (rationale: `#sync` carries no record body, so there's nothing for the publisher to XADD, but the cursor still needs to move past it so replay doesn't stall forever on a `#sync`-heavy repo). Phase 8 adversarial review surfaced this as finding 1.1: the decoder runs ahead of the publisher with up to 3072 slots of channel buffering between them, so decoder-advancing the cursor on `#sync` can move it *past* commits still queued for XADD. On hard crash or graceful-shutdown-with-Redis-down, the persister then writes the drifted cursor and earlier commits are silently lost on restart.
+
+The fix: route skip-advances as an **in-band** `PublishOp::Skip { relay, seq }` alongside `PublishOp::Publish(event, seq)` on the decoder→router→publisher channel. The publisher processes ops in channel order, so a commit queued before a skip is guaranteed to have been XADDed (or oversize-skipped) before the cursor moves past the skip's seq. This reduces the cursor-writer set to one — the publisher — so the "cursor = last fully-processed seq" invariant holds by construction rather than by careful coordination.
+
+### drain-first shutdown (biased select!)
 
 ### drain-first shutdown (biased select!)
 
@@ -220,6 +228,17 @@ On reconnect, the relay replays events from the saved cursor. Some events may al
 ---
 
 ## 4. data model
+
+### decoder preflight (frame size + CBOR depth)
+
+Before invoking any recursive decoder, every inbound WebSocket frame passes two fast, allocation-free gates (both added in Phase 8.5 from adversarial-review findings 3.1 and 3.2):
+
+1. **Byte-length gate.** Frames larger than 5 MB (the ATProto firehose spec maximum) are rejected with `DecodeError::FrameTooLarge`. `tungstenite`'s default cap is 64 MiB and `proto-blue-ws` does not currently plumb through a `WebSocketConfig` override (tracking: [proto-blue#5](https://github.com/dollspace-gay/proto-blue/issues/5)), so this is the only thing protecting peak memory from a 64 MB frame → 200–500 MB in-memory tree expansion during decode. The gate sits inside `decode_frame` so both the live pipeline and unit tests see the same enforcement.
+2. **CBOR depth preflight.** A byte-level iterative scan walks DAG-CBOR length prefixes, tracking nesting depth without building any trees. Frames exceeding 64 levels of map/array nesting are rejected with `DecodeError::FrameTooDeep`. Without this gate, a sufficiently-deep hostile frame would stack-overflow one of three recursive decoders (ciborium, `cbor_to_lex`, `lex_to_json`) and abort the process via SIGABRT — not catchable by `catch_unwind`, not caught by the tokio panic handler, and resulting in a crashloop because the relay replays the same frame from the preserved cursor after orchestrator restart. `lex_to_json` carries a depth counter of its own as defense-in-depth for the case where the preflight ever lets something slip through.
+
+Decoder task isolation: every `decode_frame` call is wrapped in `std::panic::catch_unwind(AssertUnwindSafe(...))`. Caught panics are logged at ERROR with seq-if-available and the frame's hex prefix, counter `decoder_panics_total` increments, and the task continues. Stack overflow is still not recoverable (SIGABRT bypasses unwinding) but the preflight makes that path unreachable on well-formed-CBOR-that-happens-to-be-deep.
+
+Decoder circuit breaker: after 10 consecutive decode failures the decoder signals the ws_reader supervisor (via a shared `Notify`) to drop the current connection and run failover selection. Prevents a consistently-broken relay from pinning the consumer forever. Counter on success reset; metric `decoder_circuit_opens_total`.
 
 ### event JSON schema (authoritative)
 
@@ -486,6 +505,23 @@ The consumer rejects unknown top-level version numbers with a migration guide re
 - [ ] Successful connection + 60s clean operation (connected + ≥10 events published) resets a relay's failure counter
 - [ ] Cursor keys for relay URLs with non-standard ports are correctly stored, retrieved, and cleaned up
 - [ ] On task panic, cursor reflects only successfully XADDed events (no gap on restart)
+- [ ] The publisher is the **sole** writer to the in-memory cursor. `#sync` and other skip-advance frames travel as `PublishOp::Skip { relay, seq }` on the same channel that carries events, so cursor advancement preserves channel order. *(Phase 8.5 finding 1.1.)*
+- [ ] **Timing invariant:** with `commit@100`, `skip@101`, `commit@102` queued and the backend blocked on the first XADD, the in-memory cursor remains `None`. Dropping the block and draining produces cursor = 102 with observations passing through 100 → 101 → 102 in order. Covered by `publisher::tests::skip_never_advances_cursor_past_pending_commits` and `skip_advances_cursor_in_channel_order_after_commit_succeeds`.
+- [ ] Malformed cursor in Redis (non-u64 or non-UTF-8 bytes) fails startup with `BackendError::MalformedCursor` rather than silently resuming from live tip. *(Phase 8.5 finding 4.5.)*
+
+### hostile-frame resilience *(Phase 8.5 findings 3.1, 3.2, 3.5)*
+
+- [ ] Frames larger than 5 MB are rejected with `DecodeError::FrameTooLarge` before any CBOR decoder runs.
+- [ ] Frames with CBOR nesting depth > 64 are rejected with `DecodeError::FrameTooDeep` by the preflight scan. Verified with hand-crafted fixtures for deeply-nested maps, arrays, and indefinite-length containers (DAG-CBOR disallows the latter).
+- [ ] `lex_to_json` returns `DecodeError::RecordTooDeep` on deeply-nested `LexValue` trees even if the preflight scanner is bypassed.
+- [ ] A panic inside `decode_frame` is isolated by `catch_unwind`: logged at ERROR, `decoder_panics_total` increments, decoder continues with the next frame. (Stack overflow is not catchable and the preflight scan blocks the paths that could cause one.)
+- [ ] 10 consecutive decode failures trigger `decoder_circuit_opens_total` + a forced ws_reader failover, preventing pinning on a persistently-broken relay.
+
+### security posture *(Phase 8.5 findings 4.4, 4.9)*
+
+- [ ] Relay URLs with userinfo (`wss://user:pass@host`) are rejected at config load with a validation error.
+- [ ] `config::sanitize_ws_url()` strips userinfo from any relay URL used in a log line, startup/shutdown metrics payload, or event `_relay` field — defense-in-depth for any future validation regression.
+- [ ] No credentials, tokens, or full URLs with userinfo appear in any log output.
 
 ### operational resilience
 

@@ -61,6 +61,18 @@ pub enum BackendError {
     /// a full `RedisError` constructor into test code.
     #[error("injected failure: {0}")]
     Injected(String),
+
+    /// A cursor key in Redis holds a value that isn't u64-parseable —
+    /// data corruption, a manual `redis-cli` typo, another service
+    /// stomping on our key, a botched migration. DESIGN.md §3 treats
+    /// cursor loss as silent as long as the cursor is *missing*
+    /// (resume from live tip); a *malformed* cursor is a distinct
+    /// signal that operator intervention is needed. Phase 8.5 review
+    /// finding 4.5: the old `.ok()` swallowed this into "no prior
+    /// cursor" and silently lost every event between the corrupted
+    /// seq and live tip.
+    #[error("cursor at key {key:?} is not u64-parseable: {value:?}")]
+    MalformedCursor { key: String, value: String },
 }
 
 /// The small surface area the publisher and cursor modules need. Kept
@@ -240,7 +252,16 @@ impl StreamBackend for RedisBackend {
 
     async fn get_cursor(&self, key: &str) -> Result<Option<u64>, BackendError> {
         let raw: Option<String> = self.conn.lock().await.get(key).await?;
-        Ok(raw.and_then(|s| s.parse::<u64>().ok()))
+        match raw {
+            None => Ok(None),
+            Some(s) => s
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| BackendError::MalformedCursor {
+                    key: key.to_string(),
+                    value: s,
+                }),
+        }
     }
 
     async fn xlen(&self, stream_key: &str) -> Result<u64, BackendError> {
@@ -335,6 +356,17 @@ impl InMemoryBackend {
             .insert(key.to_string(), seq.to_string().into_bytes());
     }
 
+    /// Seed a raw byte value under a cursor key. Used by Phase 8.5
+    /// tests that need to simulate corrupt or non-UTF-8 cursor
+    /// contents (DESIGN.md §3 "cursor rejection" path).
+    pub async fn seed_cursor_raw(&self, key: &str, bytes: &[u8]) {
+        self.inner
+            .lock()
+            .await
+            .kv
+            .insert(key.to_string(), bytes.to_vec());
+    }
+
     pub async fn set_fail_mode(&self, mode: FailMode) {
         self.inner.lock().await.fail_mode = mode;
     }
@@ -425,11 +457,21 @@ impl StreamBackend for InMemoryBackend {
     async fn get_cursor(&self, key: &str) -> Result<Option<u64>, BackendError> {
         let mut state = self.inner.lock().await;
         Self::maybe_inject_failure(&mut state, "get_cursor")?;
-        Ok(state
-            .kv
-            .get(key)
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .and_then(|s| s.parse::<u64>().ok()))
+        match state.kv.get(key) {
+            None => Ok(None),
+            Some(bytes) => {
+                let s = std::str::from_utf8(bytes).map_err(|_| BackendError::MalformedCursor {
+                    key: key.to_string(),
+                    value: format!("<non-UTF-8: {} bytes>", bytes.len()),
+                })?;
+                s.parse::<u64>()
+                    .map(Some)
+                    .map_err(|_| BackendError::MalformedCursor {
+                        key: key.to_string(),
+                        value: s.to_string(),
+                    })
+            }
+        }
     }
 
     async fn xlen(&self, stream_key: &str) -> Result<u64, BackendError> {
@@ -481,6 +523,33 @@ mod tests {
         assert_eq!(b.get_cursor("c").await.unwrap(), None);
         b.set_cursor("c", 42).await.unwrap();
         assert_eq!(b.get_cursor("c").await.unwrap(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn get_cursor_returns_malformed_error_on_non_u64_value() {
+        // Phase 8.5 review finding 4.5: propagate parse errors so
+        // `load_initial` can tell "missing" from "corrupted" and
+        // fail startup on the latter. Seed a corrupt cursor by
+        // writing non-numeric bytes via the fake's kv_snapshot path.
+        let b = InMemoryBackend::new();
+        b.seed_cursor_raw("firehose:cursor:abc", b"not-a-u64").await;
+        let err = b.get_cursor("firehose:cursor:abc").await.unwrap_err();
+        match err {
+            BackendError::MalformedCursor { key, value } => {
+                assert_eq!(key, "firehose:cursor:abc");
+                assert_eq!(value, "not-a-u64");
+            }
+            other => panic!("expected MalformedCursor, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_cursor_returns_malformed_error_on_non_utf8_value() {
+        let b = InMemoryBackend::new();
+        b.seed_cursor_raw("firehose:cursor:abc", &[0xff, 0xfe, 0xfd])
+            .await;
+        let err = b.get_cursor("firehose:cursor:abc").await.unwrap_err();
+        assert!(matches!(err, BackendError::MalformedCursor { .. }));
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ use crate::cursor::{Cursors, cursor_key, spawn_persister};
 use crate::decoder::{DecodedFrame, decode_frame};
 use crate::event::Event;
 use crate::metrics::Metrics;
-use crate::publisher::{self, PublisherOptions};
+use crate::publisher::{self, PublishOp, PublisherOptions};
 use crate::router::{self, RouterOptions};
 
 const RELAY: &str = "wss://relay.test/xrpc/com.atproto.sync.subscribeRepos";
@@ -88,8 +88,8 @@ async fn pipeline_publishes_every_fixture_event_and_advances_cursor() {
     let cursors = Cursors::new();
 
     // Set up the channels: decoder-out → router-in → publisher-in.
-    let (router_in_tx, router_in_rx) = mpsc::channel::<(Event, u64)>(1024);
-    let (pub_in_tx, pub_in_rx) = mpsc::channel::<(Event, u64)>(1024);
+    let (router_in_tx, router_in_rx) = mpsc::channel::<PublishOp>(1024);
+    let (pub_in_tx, pub_in_rx) = mpsc::channel::<PublishOp>(1024);
 
     // Empty filter → pass everything.
     let router_handle = router::spawn(
@@ -113,8 +113,11 @@ async fn pipeline_publishes_every_fixture_event_and_advances_cursor() {
     );
 
     // Feed decoded events into the pipeline.
-    for pair in decoded.iter().cloned() {
-        router_in_tx.send(pair).await.unwrap();
+    for (ev, seq) in decoded.iter().cloned() {
+        router_in_tx
+            .send(PublishOp::Publish(ev, seq))
+            .await
+            .unwrap();
     }
     drop(router_in_tx);
 
@@ -145,8 +148,8 @@ async fn pipeline_with_filter_drops_non_matching_commits() {
     let backend = Arc::new(InMemoryBackend::new());
     let cursors = Cursors::new();
 
-    let (router_in_tx, router_in_rx) = mpsc::channel::<(Event, u64)>(1024);
-    let (pub_in_tx, pub_in_rx) = mpsc::channel::<(Event, u64)>(1024);
+    let (router_in_tx, router_in_rx) = mpsc::channel::<PublishOp>(1024);
+    let (pub_in_tx, pub_in_rx) = mpsc::channel::<PublishOp>(1024);
 
     // Only pass app.bsky.feed.post. Commits without posts must be
     // dropped; identity/account/handle/tombstone must still pass.
@@ -170,8 +173,11 @@ async fn pipeline_with_filter_drops_non_matching_commits() {
         Metrics::new(),
     );
 
-    for pair in decoded.iter().cloned() {
-        router_in_tx.send(pair).await.unwrap();
+    for (ev, seq) in decoded.iter().cloned() {
+        router_in_tx
+            .send(PublishOp::Publish(ev, seq))
+            .await
+            .unwrap();
     }
     drop(router_in_tx);
 
@@ -217,8 +223,8 @@ async fn pipeline_maxlen_trims_but_cursor_reflects_all_publishes() {
     let cursors = Cursors::new();
     const TRIM_LEN: u64 = 5;
 
-    let (router_in_tx, router_in_rx) = mpsc::channel::<(Event, u64)>(1024);
-    let (pub_in_tx, pub_in_rx) = mpsc::channel::<(Event, u64)>(1024);
+    let (router_in_tx, router_in_rx) = mpsc::channel::<PublishOp>(1024);
+    let (pub_in_tx, pub_in_rx) = mpsc::channel::<PublishOp>(1024);
 
     let router_handle = router::spawn(
         RouterOptions {
@@ -240,8 +246,11 @@ async fn pipeline_maxlen_trims_but_cursor_reflects_all_publishes() {
         Metrics::new(),
     );
 
-    for pair in decoded.iter().cloned() {
-        router_in_tx.send(pair).await.unwrap();
+    for (ev, seq) in decoded.iter().cloned() {
+        router_in_tx
+            .send(PublishOp::Publish(ev, seq))
+            .await
+            .unwrap();
     }
     drop(router_in_tx);
 
@@ -302,8 +311,8 @@ async fn pipeline_recovers_from_transient_redis_outage_without_losing_events() {
         .set_fail_mode(crate::backend::FailMode::FailNext(4))
         .await;
 
-    let (router_in_tx, router_in_rx) = mpsc::channel::<(Event, u64)>(1024);
-    let (pub_in_tx, pub_in_rx) = mpsc::channel::<(Event, u64)>(1024);
+    let (router_in_tx, router_in_rx) = mpsc::channel::<PublishOp>(1024);
+    let (pub_in_tx, pub_in_rx) = mpsc::channel::<PublishOp>(1024);
 
     let router_handle = router::spawn(
         RouterOptions {
@@ -329,8 +338,11 @@ async fn pipeline_recovers_from_transient_redis_outage_without_losing_events() {
         Metrics::new(),
     );
 
-    for pair in decoded.iter().cloned() {
-        router_in_tx.send(pair).await.unwrap();
+    for (ev, seq) in decoded.iter().cloned() {
+        router_in_tx
+            .send(PublishOp::Publish(ev, seq))
+            .await
+            .unwrap();
     }
     drop(router_in_tx);
 
