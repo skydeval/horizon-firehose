@@ -127,6 +127,14 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         WebSocketKeepAliveOpts {
             max_reconnect_seconds: 60,
             heartbeat_interval_ms: 10_000,
+            // Capture is a short-lived session against a single
+            // URL; small caps so the tool doesn't spin forever on a
+            // silently-broken relay. If the SDK exhausts 3
+            // reconnects or goes silent for 60 s, we'd rather
+            // surface the error and exit than silently accumulate
+            // zero frames.
+            per_recv_timeout_ms: Some(60_000),
+            max_reconnect_attempts: Some(3),
         },
     );
     ws.connect()

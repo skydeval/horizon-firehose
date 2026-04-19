@@ -16,27 +16,24 @@
 //! 4. On disconnect, record the failure (possibly setting cooldown if
 //!    the per-relay threshold was hit), back off, repeat.
 //!
-//! # Why we wrap `proto-blue-ws::recv` with a timeout
+//! # Historical note on the silent-relay / runaway-reconnect problem
 //!
-//! `WebSocketKeepAlive::recv` runs an internal unbounded reconnect
-//! loop pinned to a single URL: any reconnectable error (TCP RST,
-//! heartbeat timeout, etc.) is silently retried with proto-blue-ws's
-//! own backoff. Only a clean Close (`Ok(None)`) or a non-reconnectable
-//! error surfaces. That breaks failover: a relay whose TCP keeps
-//! refusing would trap the supervisor inside `recv` forever, and we'd
-//! never get a chance to pick a fallback.
+//! Pre-Phase-8.6, `WebSocketKeepAlive::recv` retried reconnectable
+//! errors indefinitely and never surfaced silence on a
+//! TCP-accepting-then-not-sending relay. Our supervisor wrapped
+//! `recv` in an external `tokio::time::timeout(60s)` and tracked
+//! outer-loop failures manually to implement failover.
 //!
-//! `read_timeout` bounds that worst case. If `recv` doesn't return a
-//! frame within the window, we drop the inner client and surrender
-//! back to the outer loop, which records a failure and runs the
-//! selection algorithm again. ATProto firehose traffic is continuous
-//! (~1500 events/sec), so any silence longer than `read_timeout` is
-//! genuinely degraded operation and should be treated as a failure.
-//!
-//! Upstream tracking: <https://github.com/dollspace-gay/proto-blue/issues/3>.
-//! If proto-blue-ws grows a way to surface reconnect attempts (or a
-//! bounded-retry mode) this wrapper can shrink to just the
-//! supervisor bookkeeping.
+//! **Closed by upstream as of proto-blue 0.2.4** (commit
+//! `9bc4e51`, Doll): `WebSocketKeepAliveOpts` now takes a
+//! `per_recv_timeout_ms` (bounds silence, triggers an internal
+//! reconnect) and `max_reconnect_attempts` (caps internal retries,
+//! surfaces `WsError::ReconnectExhausted { attempts }` when hit).
+//! Our supervisor matches on that variant and rotates to the
+//! next relay in the fallback list. Both features are native; no
+//! external wrapper needed. See
+//! <https://github.com/dollspace-gay/proto-blue/issues/3> — closed
+//! by upstream, integrated in horizon-firehose phase 8.6.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -85,8 +82,19 @@ pub struct WsReaderOptions {
     /// Heartbeat interval handed to proto-blue-ws.
     pub heartbeat_interval_ms: u64,
 
-    /// Outer read deadline. See module docs for why this exists.
-    pub read_timeout: Duration,
+    /// Upper bound on silence from a TCP-accepting-then-not-sending
+    /// relay. Passed to `WebSocketKeepAliveOpts::per_recv_timeout_ms`.
+    /// ATProto firehose is continuous (~1500 events/sec) so 60 s
+    /// silence is degraded operation by definition — the SDK
+    /// reconnects internally when this trips.
+    pub per_recv_timeout: Duration,
+
+    /// Cap on consecutive failed reconnects before the SDK surfaces
+    /// `WsError::ReconnectExhausted`. Passed to
+    /// `WebSocketKeepAliveOpts::max_reconnect_attempts`. When hit,
+    /// the supervisor rotates to the next relay in the fallback
+    /// list.
+    pub max_reconnect_attempts: u32,
 }
 
 impl Default for WsReaderOptions {
@@ -96,7 +104,8 @@ impl Default for WsReaderOptions {
             clean_window: Duration::from_secs(60),
             clean_frames: 10,
             heartbeat_interval_ms: 10_000,
-            read_timeout: Duration::from_secs(60),
+            per_recv_timeout: Duration::from_secs(60),
+            max_reconnect_attempts: 5,
         }
     }
 }
@@ -215,6 +224,19 @@ impl SharedState {
         if r.consecutive_failures >= threshold {
             r.cooldown_until = Some(now + cooldown);
         }
+    }
+
+    /// Phase 8.6: SDK surfaced `WsError::ReconnectExhausted` —
+    /// the inner client already tried `attempts` reconnects. That's
+    /// enough signal to treat this relay as bad *right now* without
+    /// needing `failover_threshold` more outer-loop failures to
+    /// reach cooldown. Push the relay straight into cooldown so the
+    /// next `pick_relay` call picks a fallback.
+    fn force_cooldown(&mut self, idx: usize, now: Instant, cooldown: Duration) {
+        let r = &mut self.relays[idx];
+        r.consecutive_failures = r.consecutive_failures.saturating_add(1);
+        r.last_failed_at = Some(now);
+        r.cooldown_until = Some(now + cooldown);
     }
 
     fn reset_failures(&mut self, idx: usize) {
@@ -546,10 +568,22 @@ async fn supervisor(
                 // disconnect grows it. Otherwise a long-running
                 // healthy session that eventually disconnects would
                 // sleep for the pre-reset compounded value.
+                //
+                // Phase 8.6: if the outcome is `ReconnectExhausted`,
+                // the SDK already tried its inner budget of reconnects
+                // on this URL. Push the relay straight into cooldown
+                // instead of waiting for another `failover_threshold`
+                // outer failures — the evidence is already in.
+                let force_cooldown =
+                    matches!(outcome, ConnectionOutcome::ReconnectExhausted { .. });
                 let (consecutive, reconnect_metrics, had_clean_op) = {
                     let mut s = state.lock().unwrap();
                     let had_clean_op = s.take_clean_flag();
-                    s.record_failure(idx, Instant::now(), cfg.failover_threshold, cooldown);
+                    if force_cooldown {
+                        s.force_cooldown(idx, Instant::now(), cooldown);
+                    } else {
+                        s.record_failure(idx, Instant::now(), cfg.failover_threshold, cooldown);
+                    }
                     let consecutive = s.relays[idx].consecutive_failures;
                     let rm = s.metrics(Instant::now());
                     (consecutive, rm, had_clean_op)
@@ -587,7 +621,17 @@ enum ConnectionOutcome {
     Shutdown,
     DownstreamGone,
     ConnectFailed,
-    ReadTimeout,
+    /// Phase 8.6: SDK surfaced `WsError::ReconnectExhausted` after
+    /// its internal reconnect budget (`max_reconnect_attempts`) was
+    /// exhausted. Treated as a terminal failure for this relay;
+    /// supervisor rotates to the next fallback. The carried
+    /// `attempts` count is read via `{failure:?}` in the
+    /// `relay_disconnected` structured log line — dead-code
+    /// analysis doesn't see that usage.
+    #[allow(dead_code)]
+    ReconnectExhausted {
+        attempts: u32,
+    },
     CleanlyClosed,
     Error,
     /// Decoder asked us to reconnect because consecutive decode
@@ -630,6 +674,13 @@ async fn run_one_connection(
         WebSocketKeepAliveOpts {
             max_reconnect_seconds: inner_max_secs,
             heartbeat_interval_ms: opts.heartbeat_interval_ms,
+            // Phase 8.6: SDK-native silence bound. Replaces our old
+            // `tokio::time::timeout(read_timeout, ws.recv())` wrapper.
+            per_recv_timeout_ms: Some(opts.per_recv_timeout.as_millis() as u64),
+            // Phase 8.6: SDK-native reconnect cap. When hit, recv
+            // returns `WsError::ReconnectExhausted` and we rotate to
+            // the next fallback relay.
+            max_reconnect_attempts: Some(opts.max_reconnect_attempts),
         },
     );
 
@@ -670,6 +721,12 @@ async fn run_one_connection(
     let mut failures_reset = false;
 
     loop {
+        // Phase 8.6: no more `tokio::time::timeout(opts.read_timeout,
+        // ws.recv())` wrapper. proto-blue-ws bounds silence itself
+        // via `per_recv_timeout_ms` (set above) and triggers an
+        // internal reconnect; if that reconnect loop exhausts the
+        // configured cap, `recv` surfaces `WsError::ReconnectExhausted`
+        // and we rotate to the next fallback relay.
         let result = tokio::select! {
             biased;
             _ = shutdown_rx.changed() => return ConnectionOutcome::Shutdown,
@@ -680,24 +737,26 @@ async fn run_one_connection(
                 );
                 return ConnectionOutcome::ForcedReconnect;
             }
-            r = tokio::time::timeout(opts.read_timeout, ws.recv()) => r,
+            r = ws.recv() => r,
         };
 
         let data = match result {
-            Err(_) => {
-                warn!(
-                    relay = %relay_label,
-                    timeout_secs = opts.read_timeout.as_secs(),
-                    "no data within read_timeout; treating as failure"
-                );
-                return ConnectionOutcome::ReadTimeout;
-            }
-            Ok(Ok(Some(data))) => data,
-            Ok(Ok(None)) => {
+            Ok(Some(data)) => data,
+            Ok(None) => {
                 info!(relay = %relay_label, "server closed connection cleanly");
                 return ConnectionOutcome::CleanlyClosed;
             }
-            Ok(Err(e)) => {
+            Err(proto_blue_ws::WsError::ReconnectExhausted { attempts }) => {
+                warn!(
+                    target: "horizon_firehose::metrics",
+                    event_type = "ws_reconnect_exhausted",
+                    relay = %relay_label,
+                    attempts,
+                    "SDK exhausted reconnect budget on this relay; rotating to fallback"
+                );
+                return ConnectionOutcome::ReconnectExhausted { attempts };
+            }
+            Err(e) => {
                 warn!(relay = %relay_label, error = %e, "ws recv error");
                 return ConnectionOutcome::Error;
             }
@@ -904,8 +963,16 @@ mod tests {
             clean_window: Duration::from_millis(100),
             clean_frames: 2,
             heartbeat_interval_ms: 60_000,
-            // Long enough that no test trips it accidentally.
-            read_timeout: Duration::from_secs(10),
+            // Long enough that no test trips it accidentally — the
+            // SDK bounds silence internally via `per_recv_timeout_ms`
+            // now (Phase 8.6), so we want this well above any test's
+            // run duration.
+            per_recv_timeout: Duration::from_secs(10),
+            // Phase 8.6: cap reconnects per connection. Test mocks
+            // either accept immediately or close, so we shouldn't
+            // hit this; small cap to fail fast if something goes
+            // sideways.
+            max_reconnect_attempts: 3,
         }
     }
 
@@ -1230,5 +1297,71 @@ mod tests {
         );
 
         server.shutdown().await;
+    }
+
+    // ─── Phase 8.6: SDK `ReconnectExhausted` → force-cooldown + failover ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_exhausted_forces_cooldown_and_rotates_to_fallback() {
+        // Phase 8.6: the SDK's `ReconnectExhausted` fires after N
+        // consecutive failed *connect* attempts (successful connects
+        // reset the counter). To trigger it we need the primary to
+        // accept the initial connection then become unreachable.
+        //
+        // Strategy: spawn primary, let the supervisor connect, then
+        // shut the primary's listener down. The established
+        // connection dies (or silently stalls; `per_recv_timeout`
+        // surfaces the stall), the SDK tries to reconnect, fails
+        // `max_reconnect_attempts` times against the now-dead port,
+        // returns `ReconnectExhausted`. Our supervisor pushes the
+        // primary into cooldown and rotates to the fallback.
+        let primary = start_mock(vec![Behavior::SendThenHold(vec![])]).await;
+        let fallback = start_mock(vec![Behavior::SendThenHold(vec![
+            b"from-fallback".to_vec(),
+        ])])
+        .await;
+
+        let mut cfg = relay_cfg(&primary.url, &[fallback.url.as_str()]);
+        cfg.reconnect_initial_delay_ms = 10;
+        cfg.reconnect_max_delay_ms = 100;
+
+        let primary_url = primary.url.clone();
+        let fallback_url = fallback.url.clone();
+
+        // Very small per_recv_timeout + small max_reconnect_attempts
+        // so the test completes in < 5 s once the primary dies.
+        let opts = WsReaderOptions {
+            per_recv_timeout: Duration::from_millis(100),
+            max_reconnect_attempts: 2,
+            ..test_options()
+        };
+        let mut reader = spawn(cfg, opts);
+
+        // Give the supervisor a moment to hit the primary's TCP
+        // accept, then shut the listener down so subsequent reconnect
+        // attempts fail with connection-refused (`reconnects`
+        // accumulates toward the cap).
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        primary.shutdown().await;
+
+        let frame = tokio::time::timeout(Duration::from_secs(10), reader.recv())
+            .await
+            .expect("never got a frame from the fallback")
+            .expect("channel closed");
+        assert_eq!(frame.0, b"from-fallback");
+        assert_eq!(frame.1, fallback_url);
+
+        // Primary must be in cooldown — the Phase 8.6 `force_cooldown`
+        // branch runs on any `ReconnectExhausted` outcome.
+        let states = reader.relay_states();
+        assert_eq!(states[0].url, primary_url);
+        assert!(
+            states[0].cooldown_until.is_some(),
+            "primary should be in cooldown after ReconnectExhausted — got {states:?}"
+        );
+        assert_eq!(states[1].url, fallback_url);
+
+        reader.shutdown().await;
+        fallback.shutdown().await;
     }
 }

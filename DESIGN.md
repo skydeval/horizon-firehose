@@ -206,6 +206,18 @@ Selection algorithm:
 
 This prevents oscillation when primary is consistently broken and uses the full fallback list correctly when multiple relays are degraded.
 
+### silent-relay timeout + reconnect budget (phase 8.6)
+
+Two knobs live inside `proto-blue-ws`'s `WebSocketKeepAliveOpts` and govern the SDK's internal reconnect loop:
+
+- **`per_recv_timeout_ms`** (default 60 s in horizon-firehose). Upper bound on silence from a TCP-accepting-then-not-sending relay. ATProto firehose is continuous (~1500 events/sec); silence this long is degraded operation by definition. When it trips the SDK drops the transport and runs its internal reconnect state machine.
+
+- **`max_reconnect_attempts`** (default 5). Cap on consecutive *failed connect* attempts inside the SDK's reconnect loop. When hit, `recv` surfaces `WsError::ReconnectExhausted { attempts }`. Our supervisor matches on that variant, pushes the affected relay **straight into cooldown** (bypassing the usual `failover_threshold` counting), and rotates to the next fallback on the next iteration.
+
+Pre-Phase-8.6 these behaviours lived in the ws_reader itself: an external `tokio::time::timeout(60s, ws.recv())` wrapper for silence, plus manual tracking of "this endpoint has been dead too long, move on." Both were workarounds for proto-blue-ws < 0.2.4 and closed by Doll in upstream commit `9bc4e51` ([proto-blue#3](https://github.com/dollspace-gay/proto-blue/issues/3)). The supervisor now contains only cooldown bookkeeping, not timing logic — the SDK is the source of truth for "is this WebSocket endpoint viable."
+
+Semantics shift to note: `max_reconnect_attempts` counts **consecutive connect failures**, not recv timeouts. A recv timeout triggers disconnect + reconnect, but if the reconnect *succeeds* the counter resets. So the path to `ReconnectExhausted` requires a relay that accepts the initial TCP connection then becomes unreachable at the TCP layer (port closed, route dropped). For a relay that keeps accepting but never sends data, silence still triggers reconnects forever — and in that case our decoder circuit breaker (Phase 8.5 finding 3.4) kicks in separately from "got garbage" rather than "got silence". Both paths lead to the same `force_cooldown` branch in the supervisor.
+
 ### shutdown ordering
 
 On SIGTERM or SIGINT:
