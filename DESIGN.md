@@ -388,7 +388,19 @@ level = "info"
 format = "json"                       # or "pretty"
 ```
 
-Config loaded at startup. Environment variables with `HORIZON_FIREHOSE_` prefix override TOML values (e.g., `HORIZON_FIREHOSE_REDIS_URL`).
+Config loaded at startup. Environment variables with the `HORIZON_FIREHOSE_` prefix override TOML values, using **`__` (double underscore) as the section separator** and a single underscore inside field names. Examples:
+
+```
+HORIZON_FIREHOSE_REDIS__URL=redis://prod-redis:6379
+HORIZON_FIREHOSE_RELAY__URL=wss://relay.fyi
+HORIZON_FIREHOSE_RELAY__RECONNECT_INITIAL_DELAY_MS=2000
+HORIZON_FIREHOSE_LOGGING__LEVEL=debug
+HORIZON_FIREHOSE_CONFIG_VERSION=1
+```
+
+The double-underscore convention is deliberate. Many of our field names already contain single underscores (`reconnect_initial_delay_ms`, `failover_cooldown_seconds`, `max_event_size_bytes`, `cleanup_unknown_cursors`, etc.), so a single-underscore separator would be ambiguous: `HORIZON_FIREHOSE_RELAY_RECONNECT_INITIAL_DELAY_MS` could split as `relay.reconnect.initial.delay.ms` (wrong) or `relay.reconnect_initial_delay_ms` (right). Splitting on `__` makes the intent unambiguous and matches figment's standard convention.
+
+The path that selects which config file to load is itself controlled by `HORIZON_FIREHOSE_CONFIG` (no double underscore — this overrides the file path, not a TOML field). Default is `./config.toml`.
 
 ### config version bump policy
 

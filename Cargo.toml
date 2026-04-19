@@ -51,6 +51,9 @@ tokio-test = "0.4"
 # Property-based testing
 proptest = "1"
 
+# `Jail` (sandboxed env + cwd for config tests) is gated behind figment's `test` feature.
+figment = { version = "0.10", features = ["toml", "env", "test"] }
+
 # In-memory Redis for tests
 # (we'll figure out the right crate during phase 4 — options: `redis-test`, `mini-redis`, or a Docker harness)
 

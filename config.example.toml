@@ -1,0 +1,79 @@
+# horizon-firehose example configuration
+#
+# Copy this file to `config.toml` and edit for your deployment.
+# The runtime config path defaults to `./config.toml` and can be
+# overridden with the HORIZON_FIREHOSE_CONFIG environment variable.
+#
+# Any value below can be overridden with an environment variable using
+# the HORIZON_FIREHOSE_ prefix. Sections are separated from field names
+# by a *double* underscore; single underscores are kept inside field
+# names that already contain them (e.g. reconnect_initial_delay_ms).
+# Single-underscore as a section separator would be ambiguous, since
+# many of our field names contain underscores themselves.
+#
+# Examples:
+#   HORIZON_FIREHOSE_REDIS__URL=redis://prod-redis:6379
+#   HORIZON_FIREHOSE_RELAY__URL=wss://relay.fyi
+#   HORIZON_FIREHOSE_RELAY__RECONNECT_INITIAL_DELAY_MS=2000
+#   HORIZON_FIREHOSE_LOGGING__LEVEL=debug
+#   HORIZON_FIREHOSE_CONFIG_VERSION=1     # top-level field, no `__`
+#
+# HORIZON_FIREHOSE_CONFIG itself selects which file to load (default
+# `./config.toml`); it isn't a TOML field, so it has no `__` either.
+
+# Schema version. The consumer rejects newer versions with a migration
+# message. See DESIGN.md §4 "config version bump policy".
+config_version = 1
+
+[relay]
+url = "wss://bsky.network"
+fallbacks = []
+
+# Example multi-relay configuration:
+# fallbacks = [
+#   "wss://relay.fyi",
+#   "wss://relay.blacksky.app",
+# ]
+
+reconnect_initial_delay_ms = 1000
+reconnect_max_delay_ms = 60000
+failover_threshold = 5
+failover_cooldown_seconds = 600
+tls_extra_ca_file = ""
+
+[redis]
+url = "redis://redis:6379"
+stream_key = "firehose:events"
+max_stream_len = 500000
+cleanup_unknown_cursors = false
+
+[filter]
+# Empty array passes all record types through. Populate with NSIDs
+# to drop everything else, e.g. record_types = ["app.bsky.feed.post"].
+record_types = []
+
+[cursor]
+save_interval_seconds = 5
+# How to handle the relay rejecting our cursor as stale.
+# "live_tip" — resume from the relay's live tip and log a WARN gap.
+# "exit"     — exit non-zero so the operator can intervene.
+on_stale_cursor = "live_tip"
+# How to handle a non-OutdatedCursor protocol error frame.
+# "reconnect_from_live_tip" — drop cursor, reconnect at live tip.
+# "exit"                    — exit non-zero.
+on_protocol_error = "reconnect_from_live_tip"
+
+[publisher]
+max_event_size_bytes = 1048576    # 1 MiB
+# What to do with an event that exceeds max_event_size_bytes.
+# "skip_with_log" — drop the event, log at WARN, increment counter.
+# "fail_hard"     — exit non-zero.
+on_oversize = "skip_with_log"
+
+[logging]
+# Either a bare level (trace|debug|info|warn|error) or any
+# tracing-subscriber EnvFilter directive (e.g. "info,horizon_firehose=debug").
+level = "info"
+# "json"   — structured one-line-per-event for log aggregation.
+# "pretty" — human-readable for local development.
+format = "json"

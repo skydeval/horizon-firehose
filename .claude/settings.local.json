@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Read(//c/Users/Chrys/.cargo/**)",
+      "Bash(command -v cargo.exe)",
+      "Bash(cmd //c \"where cargo\")",
+      "Bash(cmd //c \"where rustc\")",
+      "Bash(powershell.exe -NoProfile -Command \"Get-Command cargo -ErrorAction SilentlyContinue; Get-Command rustc -ErrorAction SilentlyContinue; Get-Command rustup -ErrorAction SilentlyContinue\")",
+      "Bash(cmd //c \"dir /b /s C:\\\\cargo.exe\")",
+      "Bash(cmd //c \"dir /b /s D:\\\\cargo.exe\")",
+      "Bash(cmd //c \"wsl --list --quiet\")",
+      "Bash(cmd //c \"wsl which cargo\")",
+      "Bash(cmd //c \"wsl -d Ubuntu-24.04 -- bash -lc 'which cargo && cargo --version'\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"which cargo; cargo --version\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo build 2>&1 | tail -60\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo build 2>&1 | tail -40\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test 2>&1 | tail -60\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test 2>&1 | tail -40\")",
+      "Bash(gh search *)",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"which gh && gh --version | head -1\")",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo build 2>&1 | tail -5\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test --quiet 2>&1 | tail -10\")"
+    ]
+  }
+}
