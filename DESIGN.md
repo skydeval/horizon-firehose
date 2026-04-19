@@ -164,7 +164,9 @@ horizon-firehose/
 
 - **CBOR/CAR decode failure.** Log at WARN with sequence number and hex dump of first 64 bytes. Increment `decode_errors` counter. Drop the frame and continue.
 
-- **Unknown `$type` values.** Pass through as generic JSON with the original `$type` preserved. Never reject. Increments `unknown_type_count` metric.
+- **Frame types: handled vs known-skip vs unknown.** The decoder recognizes `#commit`, `#identity`, `#account`, `#handle`, `#tombstone`, `#sync`, and `#info` (plus `op == -1` error frames). `#commit`/`#identity`/`#account`/`#handle`/`#tombstone` republish to Redis. `#info` and error frames are routed by name (`OutdatedCursor` follows `on_stale_cursor`; others follow `on_protocol_error`). **Known-skip frame types** (`#sync` today, plus any future frames that are architecturally reasonable to ignore at this layer — e.g. things that carry no per-record data the downstream Postgres indexer would write) are dropped silently with INFO-level logging and a `skipped_frames` counter increment. **Genuinely unknown frame types** (new types ATProto adds that horizon-firehose doesn't yet recognize) are logged at WARN with the type name and increment an `unknown_frame_types` counter, so operators can file issues or update the consumer. This distinction prevents alert fatigue from known-uninteresting frames while ensuring new protocol additions aren't missed.
+
+- **Unknown `$type` values.** Pass through as generic JSON with the original `$type` preserved. Never reject. Increments `unknown_type_count` metric. (Distinct from "unknown frame type" above: this is the inner record's lexicon, not the outer firehose envelope.)
 
 - **Oversized events.** Per `max_event_size_bytes` config. On exceed, behave per `on_oversize` config (`skip_with_log` default, or `fail_hard`). Increment `oversize_events` counter.
 
@@ -246,7 +248,7 @@ account_event := {
 
 **Encoding rules (authoritative):**
 
-- CIDs serialize in whatever canonical form they were transmitted in. CIDv0 stays CIDv0, CIDv1 stays CIDv1. Do not normalize CID versions.
+- CIDs serialize as the multibase-base32-lower string form (e.g. `bafyrei…`), which is the canonical and only legal CIDv1 wire form for ATProto. The data-model spec blesses CIDv1 exclusively (DASL: version `0x01`, codec `dag-cbor (0x71)` or `raw (0x55)`, hash `sha-256 (0x12)`); CIDv0 is prohibited and cannot appear on the firehose. proto-blue's CBOR decoder enforces this with a hard error on non-v1 input, so any v0 byte sequence would surface as a `decode_errors` increment, not a silent normalization. Verified empirically against 79,651 CIDs across 1000 captured frames: 100% v1.
 - Bytes fields serialize as lowercase hexadecimal (no `0x` prefix).
 - Timestamps serialize as ISO 8601 UTC with millisecond precision.
 - Nested record objects pass through as deserialized by proto-blue, preserving field order per DAG-CBOR rules.
@@ -264,6 +266,10 @@ account_event := {
 - `type`: string — the event type, one of `"commit"`, `"identity"`, `"account"`, `"handle"`, `"tombstone"`
 - `data`: string — JSON-encoded event payload per the schema above
 - `seq`: string — the sequence number from the firehose frame
+
+**Frames that produce no Redis stream entry:**
+- `#sync` frames carry a repo's current head CID without operations and are emitted by the relay for fast catch-up by indexers that need only the head pointer. The downstream Postgres indexer is record-driven and has nothing to write for them, so horizon-firehose drops them at the decoder layer with INFO-level logging — they advance the cursor but produce no `XADD`. See §3 "Frame types: handled vs known-skip vs unknown" for the broader policy.
+- `#info` / error frames are control signals routed by the supervisor (cursor handling, reconnects) rather than republished as events.
 
 **Cursor keys:** `firehose:cursor:{base64url(relay_url)}`
 - Value: integer (as string), the last successfully XADDed sequence number for that relay
