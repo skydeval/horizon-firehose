@@ -24,8 +24,10 @@ serde_json = "1"
 # Config loading (TOML + env var overrides)
 figment = { version = "0.10", features = ["toml", "env"] }
 
-# Redis client
-redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+# Redis client. `streams` pulls in XADD/XLEN helpers; `connection-manager`
+# gives us auto-reconnecting pooled connections so we don't have to hand-roll
+# reconnect logic on top of `MultiplexedConnection`.
+redis = { version = "0.27", features = ["tokio-comp", "aio", "streams", "connection-manager"] }
 
 # Error handling
 thiserror = "2"
@@ -48,6 +50,7 @@ rustls-native-certs = "0.8"
 proto-blue-api = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
 proto-blue-ws = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
 proto-blue-lex-cbor = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
+proto-blue-lex-data = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
 proto-blue-repo = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
 proto-blue-syntax = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
 

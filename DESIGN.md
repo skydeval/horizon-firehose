@@ -124,6 +124,14 @@ The service runs four concurrent tokio tasks:
 
 Bounded channels provide backpressure. Cursor advancement tied to XADD success ensures no gaps on task panic.
 
+### drain-first shutdown (biased select!)
+
+Tokio's `select!` is **unbiased by default**: when multiple branches are ready at the same time, it picks one at random. In our shutdown path this is dangerous — if the shutdown signal and pending channel events race, random selection will sometimes exit with unpublished events still in the channel, losing work the upstream relay has already replayed past.
+
+Router and publisher both use `tokio::select! { biased; … }` with the input-channel receive checked **before** the shutdown watch. This makes drain-first shutdown deterministic: pending events are always processed until the channel closes; the shutdown branch is only taken when the channel is idle (or closed). This matches the §3 "Publisher task: drain its input channel, XADD all remaining events" ordering without relying on the scheduler's coin flip.
+
+Mid-retry shutdown is a separate concern: the publisher's Redis retry loop has its own `biased` select with shutdown first, so an operator calling shutdown during a Redis outage gets an immediate bounded-time exit. The cursor invariant still holds — it reflects only XADDed events, so the in-flight event on force-exit is replayed on next start.
+
 ### backpressure — accurate description
 
 When downstream is slower than the firehose, bounded channel backpressure causes the WebSocket reader to stop consuming frames. TCP buffers fill, and the relay will eventually disconnect the consumer as a slow reader (typically after 60-120 seconds of no reads). On reconnect, the consumer resumes from its last saved cursor, and the relay replays events from that point.

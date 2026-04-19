@@ -28,6 +28,28 @@ mod error;
 // a later phase when the decoder + publisher tasks exist to wire to.
 #[allow(dead_code)]
 mod ws_reader;
+// Phase 3 modules — same story: compiled and tested in isolation,
+// wired into the pipeline later.
+#[allow(dead_code)]
+mod decoder;
+#[allow(dead_code)]
+mod event;
+// Phase 4 modules — router, publisher, cursor, plus the storage
+// backend abstraction they share. Tested in isolation against an
+// in-memory fake; Phase 5 wires them together in `run`.
+#[allow(dead_code)]
+mod backend;
+#[allow(dead_code)]
+mod cursor;
+#[allow(dead_code)]
+mod publisher;
+#[allow(dead_code)]
+mod router;
+// End-to-end pipeline test. Lives in its own module because it
+// spans decoder → router → publisher → backend and doesn't belong
+// to any one of them.
+#[cfg(test)]
+mod pipeline_test;
 
 use std::process::ExitCode;
 

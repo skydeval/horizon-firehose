@@ -36,7 +36,9 @@ use crate::event::{
 /// Top-level result of decoding one binary frame.
 #[derive(Debug)]
 pub enum DecodedFrame {
-    Event(Event),
+    /// A republishable event, carrying the firehose sequence number
+    /// that Phase 4's publisher uses as the cursor advance target.
+    Event { event: Event, seq: u64 },
     /// `#info` / error frame with name `OutdatedCursor`. Supervisor
     /// branches on `cursor.on_stale_cursor` config.
     OutdatedCursor { message: Option<String> },
@@ -47,7 +49,10 @@ pub enum DecodedFrame {
     /// and has nothing for the downstream Postgres indexer to write).
     /// Distinct from `UnknownFrameType` — the latter is a real decode
     /// failure for a type the protocol added without us noticing.
-    Skipped { kind: &'static str },
+    /// `seq` is surfaced so the cursor tracker can still advance past
+    /// a skipped frame (otherwise replays would loop forever on a
+    /// `#sync` at tip).
+    Skipped { kind: &'static str, seq: u64 },
 }
 
 #[derive(Debug, Error)]
@@ -121,8 +126,12 @@ pub fn decode_frame(bytes: &[u8], relay: &str) -> Result<DecodedFrame, DecodeErr
         // `#sync` is the post-2025 firehose event that announces a
         // repo's current head without operations (used for fast
         // catch-up). It carries no per-record data, so the Postgres
-        // indexer downstream has nothing to do with it.
-        "#sync" => Ok(DecodedFrame::Skipped { kind: "#sync" }),
+        // indexer downstream has nothing to do with it. We still pull
+        // `seq` so the cursor can advance past it.
+        "#sync" => Ok(DecodedFrame::Skipped {
+            kind: "#sync",
+            seq: map_seq(body)?,
+        }),
         "#info" => {
             // `#info` envelope (different from `op=-1` errors). DESIGN.md
             // §3 calls these out specifically for OutdatedCursor handling.
@@ -144,6 +153,7 @@ fn decode_commit(
     body: &BTreeMap<String, LexValue>,
     relay: &str,
 ) -> Result<DecodedFrame, DecodeError> {
+    let seq = map_seq(body)?;
     let repo = map_str(body, "repo")?.to_string();
     let commit_cid = map_cid(body, "commit")?.to_string();
     let rev = map_str(body, "rev")?.to_string();
@@ -199,58 +209,89 @@ fn decode_commit(
         });
     }
 
-    Ok(DecodedFrame::Event(Event::Commit(CommitEvent {
-        repo,
-        commit: commit_cid,
-        rev,
-        ops,
-        time,
-        relay: relay.into(),
-    })))
+    Ok(DecodedFrame::Event {
+        event: Event::Commit(CommitEvent {
+            repo,
+            commit: commit_cid,
+            rev,
+            ops,
+            time,
+            relay: relay.into(),
+        }),
+        seq,
+    })
 }
 
 fn decode_identity(
     body: &BTreeMap<String, LexValue>,
     relay: &str,
 ) -> Result<DecodedFrame, DecodeError> {
-    Ok(DecodedFrame::Event(Event::Identity(IdentityEvent {
-        did: map_str(body, "did")?.to_string(),
-        handle: map_opt_str(body, "handle")?.map(str::to_string),
-        relay: relay.into(),
-    })))
+    Ok(DecodedFrame::Event {
+        event: Event::Identity(IdentityEvent {
+            did: map_str(body, "did")?.to_string(),
+            handle: map_opt_str(body, "handle")?.map(str::to_string),
+            relay: relay.into(),
+        }),
+        seq: map_seq(body)?,
+    })
 }
 
 fn decode_account(
     body: &BTreeMap<String, LexValue>,
     relay: &str,
 ) -> Result<DecodedFrame, DecodeError> {
-    Ok(DecodedFrame::Event(Event::Account(AccountEvent {
-        did: map_str(body, "did")?.to_string(),
-        active: map_bool(body, "active")?,
-        status: map_opt_str(body, "status")?.map(str::to_string),
-        relay: relay.into(),
-    })))
+    Ok(DecodedFrame::Event {
+        event: Event::Account(AccountEvent {
+            did: map_str(body, "did")?.to_string(),
+            active: map_bool(body, "active")?,
+            status: map_opt_str(body, "status")?.map(str::to_string),
+            relay: relay.into(),
+        }),
+        seq: map_seq(body)?,
+    })
 }
 
 fn decode_handle(
     body: &BTreeMap<String, LexValue>,
     relay: &str,
 ) -> Result<DecodedFrame, DecodeError> {
-    Ok(DecodedFrame::Event(Event::Handle(HandleEvent {
-        did: map_str(body, "did")?.to_string(),
-        handle: map_str(body, "handle")?.to_string(),
-        relay: relay.into(),
-    })))
+    Ok(DecodedFrame::Event {
+        event: Event::Handle(HandleEvent {
+            did: map_str(body, "did")?.to_string(),
+            handle: map_str(body, "handle")?.to_string(),
+            relay: relay.into(),
+        }),
+        seq: map_seq(body)?,
+    })
 }
 
 fn decode_tombstone(
     body: &BTreeMap<String, LexValue>,
     relay: &str,
 ) -> Result<DecodedFrame, DecodeError> {
-    Ok(DecodedFrame::Event(Event::Tombstone(TombstoneEvent {
-        did: map_str(body, "did")?.to_string(),
-        relay: relay.into(),
-    })))
+    Ok(DecodedFrame::Event {
+        event: Event::Tombstone(TombstoneEvent {
+            did: map_str(body, "did")?.to_string(),
+            relay: relay.into(),
+        }),
+        seq: map_seq(body)?,
+    })
+}
+
+/// Extract the firehose `seq` field as `u64`. The wire type is CBOR
+/// signed integer; the protocol guarantees it's non-negative and
+/// monotonically increasing per relay, so we reject negatives rather
+/// than silently wrapping.
+fn map_seq(body: &BTreeMap<String, LexValue>) -> Result<u64, DecodeError> {
+    let s = map_int(body, "seq")?;
+    if s < 0 {
+        return Err(DecodeError::TypeMismatch {
+            field: "seq",
+            expected: "non-negative integer",
+            got: "negative integer",
+        });
+    }
+    Ok(s as u64)
 }
 
 // ─── LexValue → serde_json::Value ──────────────────────────────────
@@ -461,7 +502,14 @@ mod tests {
     /// fixtures will see a SKIP message, not a failure).
     #[test]
     fn decodes_all_captured_fixtures() {
-        let manifest_path = Path::new("tests/fixtures/manifest.json");
+        // Absolute path via CARGO_MANIFEST_DIR — the config tests in
+        // this crate use `figment::Jail`, which changes the process
+        // CWD. A relative path here races with them under
+        // `cargo test` (default multi-threaded test runner) and
+        // intermittently fails with ENOENT even though the file is
+        // on disk.
+        let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let manifest_path = fixtures_dir.join("manifest.json");
         if !manifest_path.exists() {
             eprintln!(
                 "SKIP decoder fixture test: tests/fixtures/manifest.json not present \
@@ -470,7 +518,7 @@ mod tests {
             return;
         }
 
-        let manifest_str = fs::read_to_string(manifest_path).unwrap();
+        let manifest_str = fs::read_to_string(&manifest_path).unwrap();
         let manifest: serde_json::Value = serde_json::from_str(&manifest_str).unwrap();
         let frames = manifest["frames"].as_array().expect("frames array");
 
@@ -483,7 +531,7 @@ mod tests {
 
         for frame in frames {
             let filename = frame["filename"].as_str().unwrap();
-            let path = Path::new("tests/fixtures").join(filename);
+            let path = fixtures_dir.join(filename);
             let bytes = match fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
@@ -506,7 +554,7 @@ mod tests {
                     decoded_ok += 1;
                     *frame_kinds.entry(frame_kind_label(&frame)).or_insert(0) += 1;
 
-                    if let DecodedFrame::Event(ev) = &frame {
+                    if let DecodedFrame::Event { event: ev, .. } = &frame {
                         // Verify JSON serialisation works and the
                         // _relay invariant holds.
                         let json = serde_json::to_value(ev).expect("event serialises");
@@ -588,11 +636,11 @@ mod tests {
 
     fn frame_kind_label(f: &DecodedFrame) -> &'static str {
         match f {
-            DecodedFrame::Event(Event::Commit(_)) => "commit",
-            DecodedFrame::Event(Event::Identity(_)) => "identity",
-            DecodedFrame::Event(Event::Account(_)) => "account",
-            DecodedFrame::Event(Event::Handle(_)) => "handle",
-            DecodedFrame::Event(Event::Tombstone(_)) => "tombstone",
+            DecodedFrame::Event { event: Event::Commit(_), .. } => "commit",
+            DecodedFrame::Event { event: Event::Identity(_), .. } => "identity",
+            DecodedFrame::Event { event: Event::Account(_), .. } => "account",
+            DecodedFrame::Event { event: Event::Handle(_), .. } => "handle",
+            DecodedFrame::Event { event: Event::Tombstone(_), .. } => "tombstone",
             DecodedFrame::OutdatedCursor { .. } => "outdated_cursor",
             DecodedFrame::Info { .. } => "info",
             DecodedFrame::Skipped { .. } => "skipped",
