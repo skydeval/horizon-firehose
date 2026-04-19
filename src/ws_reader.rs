@@ -49,6 +49,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::RelayConfig;
 use crate::cursor::Cursors;
+use crate::metrics::Metrics;
 
 /// One raw WebSocket frame plus the relay URL it came from. The decoder
 /// stamps each decoded event with this so the publisher (and the
@@ -254,6 +255,44 @@ pub struct WsReader {
     pub(crate) task: JoinHandle<()>,
     shutdown_tx: Option<watch::Sender<bool>>,
     state: Arc<Mutex<SharedState>>,
+    /// A weak reference to the frames-channel sender, kept so the
+    /// metrics emitter can sample `ws_to_decoder` depth without
+    /// preventing channel close during shutdown (`mpsc::WeakSender`
+    /// doesn't count toward keep-alive).
+    frames_weak: mpsc::WeakSender<Frame>,
+}
+
+/// Cloneable accessor for ws_reader's supervisor state. Produced by
+/// [`WsReader::state_reader`] *before* `WsReader` is consumed by the
+/// decoder task, so `main` (and the metrics emitter) can still read
+/// reconnect stats later without threading a handle through the
+/// pipeline.
+#[derive(Clone)]
+pub struct WsStateReader {
+    state: Arc<Mutex<SharedState>>,
+}
+
+/// Snapshot shape convenient for the metrics emitter.
+///
+/// `total_reconnects_since_start` lives on the shared [`Metrics`]
+/// struct instead (single source of truth for the periodic emitter),
+/// so only the currently-active relay and the rolling hour gauge
+/// come through this type.
+#[derive(Debug, Clone, Default)]
+pub struct WsStateSnapshot {
+    pub active_relay: Option<String>,
+    pub reconnects_last_hour: u64,
+}
+
+impl WsStateReader {
+    pub async fn snapshot(&self, now: Instant) -> WsStateSnapshot {
+        let mut s = self.state.lock().unwrap();
+        let m = s.metrics(now);
+        WsStateSnapshot {
+            active_relay: m.active_relay,
+            reconnects_last_hour: m.reconnects_last_hour,
+        }
+    }
 }
 
 impl WsReader {
@@ -270,6 +309,19 @@ impl WsReader {
 
     pub fn relay_states(&self) -> Vec<RelayStateSnapshot> {
         self.state.lock().unwrap().snapshot()
+    }
+
+    /// Clone the supervisor state so `main` can read reconnect stats
+    /// after this `WsReader` has been moved into the decoder task.
+    pub fn state_reader(&self) -> WsStateReader {
+        WsStateReader { state: self.state.clone() }
+    }
+
+    /// WeakSender for the frames channel. Used by the metrics emitter
+    /// to sample `ws_to_decoder` depth without keeping the channel
+    /// alive past the ws_reader's exit.
+    pub fn frames_weak(&self) -> mpsc::WeakSender<Frame> {
+        self.frames_weak.clone()
     }
 
     /// Signal shutdown (if the handle owns its shutdown sender) and
@@ -289,13 +341,22 @@ impl WsReader {
 /// Phase 4 cursor tracker and the Phase 5 global-shutdown wiring.
 pub fn spawn(cfg: RelayConfig, opts: WsReaderOptions) -> WsReader {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    spawn_internal(cfg, opts, Cursors::new(), shutdown_rx, Some(shutdown_tx))
+    spawn_internal(
+        cfg,
+        opts,
+        Cursors::new(),
+        shutdown_rx,
+        Some(shutdown_tx),
+        Arc::new(Metrics::default()),
+    )
 }
 
-/// Spawn the supervisor against an **external** shutdown watch. Used
-/// by the Phase 5 coordinator in `main`: one global shutdown signal
-/// fans out to every task, and the coordinator drives the DESIGN.md
-/// §3 shutdown cascade by flipping that single watch.
+/// Spawn the supervisor against an **external** shutdown watch and a
+/// shared [`Metrics`] struct. Used by the Phase 5 coordinator in
+/// `main`: one global shutdown signal fans out to every task, and the
+/// coordinator drives the DESIGN.md §3 shutdown cascade by flipping
+/// that single watch. The Phase 6 [`Metrics`] accumulates reconnect
+/// counts and history.
 ///
 /// `cursors` is shared with the publisher. On each connect/reconnect,
 /// the supervisor reads the current cursor for the chosen relay and
@@ -306,8 +367,9 @@ pub fn spawn_with_cursors(
     opts: WsReaderOptions,
     cursors: Cursors,
     shutdown_rx: watch::Receiver<bool>,
+    metrics: Arc<Metrics>,
 ) -> WsReader {
-    spawn_internal(cfg, opts, cursors, shutdown_rx, None)
+    spawn_internal(cfg, opts, cursors, shutdown_rx, None, metrics)
 }
 
 fn spawn_internal(
@@ -316,8 +378,10 @@ fn spawn_internal(
     cursors: Cursors,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_tx: Option<watch::Sender<bool>>,
+    metrics: Arc<Metrics>,
 ) -> WsReader {
     let (frames_tx, frames_rx) = mpsc::channel(opts.frame_buffer);
+    let frames_weak = frames_tx.downgrade();
     let state = Arc::new(Mutex::new(SharedState::from_config(&cfg)));
     let task = tokio::spawn(supervisor(
         cfg,
@@ -326,12 +390,14 @@ fn spawn_internal(
         shutdown_rx,
         state.clone(),
         cursors,
+        metrics,
     ));
     WsReader {
         frames_rx,
         task,
         shutdown_tx,
         state,
+        frames_weak,
     }
 }
 
@@ -342,6 +408,7 @@ async fn supervisor(
     mut shutdown_rx: watch::Receiver<bool>,
     state: Arc<Mutex<SharedState>>,
     cursors: Cursors,
+    metrics: Arc<Metrics>,
 ) {
     let initial_backoff = Duration::from_millis(cfg.reconnect_initial_delay_ms);
     let max_backoff = Duration::from_millis(cfg.reconnect_max_delay_ms);
@@ -398,6 +465,7 @@ async fn supervisor(
             &frames_tx,
             &mut shutdown_rx,
             inner_max_secs,
+            &metrics,
         )
         .await;
 
@@ -406,7 +474,7 @@ async fn supervisor(
                 break 'outer;
             }
             ref failure => {
-                let (consecutive, metrics) = {
+                let (consecutive, reconnect_metrics) = {
                     let mut s = state.lock().unwrap();
                     s.record_failure(
                         idx,
@@ -415,8 +483,8 @@ async fn supervisor(
                         cooldown,
                     );
                     let consecutive = s.relays[idx].consecutive_failures;
-                    let metrics = s.metrics(Instant::now());
-                    (consecutive, metrics)
+                    let rm = s.metrics(Instant::now());
+                    (consecutive, rm)
                 };
                 info!(
                     target: "horizon_firehose::metrics",
@@ -424,8 +492,8 @@ async fn supervisor(
                     relay = %url,
                     reason = ?failure,
                     consecutive_failures = consecutive,
-                    total_reconnects_since_start = metrics.total_reconnects_since_start,
-                    reconnects_last_hour = metrics.reconnects_last_hour,
+                    total_reconnects_since_start = reconnect_metrics.total_reconnects_since_start,
+                    reconnects_last_hour = reconnect_metrics.reconnects_last_hour,
                     "relay disconnected; will reattempt"
                 );
 
@@ -466,6 +534,7 @@ async fn run_one_connection(
     frames_tx: &mpsc::Sender<Frame>,
     shutdown_rx: &mut watch::Receiver<bool>,
     inner_max_secs: u64,
+    metrics: &Metrics,
 ) -> ConnectionOutcome {
     info!(relay = %relay_label, connect_url = %connect_url, "connecting to relay");
 
@@ -487,17 +556,25 @@ async fn run_one_connection(
         return ConnectionOutcome::ConnectFailed;
     }
 
-    let metrics = {
+    let now = Instant::now();
+    let reconnect_metrics = {
         let mut s = state.lock().unwrap();
-        s.record_reconnect(Instant::now());
-        s.metrics(Instant::now())
+        s.record_reconnect(now);
+        s.metrics(now)
     };
+    // Mirror the reconnect into the shared Phase 6 Metrics so the
+    // periodic emitter's `relay_reconnects_in_window` /
+    // `total_reconnects_since_start` / `reconnects_last_hour` all
+    // come from the same source. Supervisor's internal counters stay
+    // for structured log lines above.
+    metrics.record_reconnect(now).await;
+
     info!(
         target: "horizon_firehose::metrics",
         event_type = "relay_connected",
         relay = %relay_label,
-        total_reconnects_since_start = metrics.total_reconnects_since_start,
-        reconnects_last_hour = metrics.reconnects_last_hour,
+        total_reconnects_since_start = reconnect_metrics.total_reconnects_since_start,
+        reconnects_last_hour = reconnect_metrics.reconnects_last_hour,
         "relay connected"
     );
 

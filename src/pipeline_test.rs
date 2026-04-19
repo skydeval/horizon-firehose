@@ -28,6 +28,7 @@ use crate::config::OversizePolicy;
 use crate::cursor::{Cursors, cursor_key, spawn_persister};
 use crate::decoder::{DecodedFrame, decode_frame};
 use crate::event::Event;
+use crate::metrics::Metrics;
 use crate::publisher::{self, PublisherOptions};
 use crate::router::{self, RouterOptions};
 
@@ -106,6 +107,7 @@ async fn pipeline_publishes_every_fixture_event_and_advances_cursor() {
             OversizePolicy::SkipWithLog,
         ),
         pub_in_rx,
+        Metrics::new(),
     );
 
     // Feed decoded events into the pipeline.
@@ -163,6 +165,7 @@ async fn pipeline_with_filter_drops_non_matching_commits() {
             OversizePolicy::SkipWithLog,
         ),
         pub_in_rx,
+        Metrics::new(),
     );
 
     for pair in decoded.iter().cloned() {
@@ -230,6 +233,7 @@ async fn pipeline_maxlen_trims_but_cursor_reflects_all_publishes() {
             OversizePolicy::SkipWithLog,
         ),
         pub_in_rx,
+        Metrics::new(),
     );
 
     for pair in decoded.iter().cloned() {
@@ -313,6 +317,7 @@ async fn pipeline_recovers_from_transient_redis_outage_without_losing_events() {
             )
         },
         pub_in_rx,
+        Metrics::new(),
     );
 
     for pair in decoded.iter().cloned() {

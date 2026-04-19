@@ -38,6 +38,7 @@ mod cursor;
 mod decoder;
 mod error;
 mod event;
+mod metrics;
 mod publisher;
 mod router;
 mod ws_reader;
@@ -153,7 +154,7 @@ fn validate_tls_extra_ca(cfg: &Config) -> Result<(), Error> {
     }
 }
 
-fn emit_startup_metrics(cfg: &Config, path: &std::path::Path) {
+pub(crate) fn emit_startup_metrics(cfg: &Config, path: &std::path::Path) {
     let payload = json!({
         "type": "startup_metrics",
         "config_version": cfg.config_version,
@@ -217,10 +218,21 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
         warn!(error = %err, "failed to load cursors at startup; resuming from live tip");
     }
 
+    // Shared metrics. Every task that produces counters holds an
+    // `Arc<Metrics>`; the periodic emitter samples them on a ticker
+    // and diffs against the previous sample to produce the
+    // `*_in_window` fields from DESIGN.md §4.
+    let metrics = metrics::Metrics::new();
+
     // Channels between pipeline stages. All bounded — backpressure
     // cascades upstream to the relay if a downstream stage stalls.
     let (event_tx, event_rx) = mpsc::channel::<(event::Event, u64)>(CHANNEL_BUFFER);
     let (filtered_tx, filtered_rx) = mpsc::channel::<(event::Event, u64)>(CHANNEL_BUFFER);
+    // Downgrade the producer sides so the metrics emitter can sample
+    // channel depth without keeping the channel alive past the
+    // producer's exit — see metrics::ChannelGauges docs for why.
+    let decoder_to_router_weak = event_tx.downgrade();
+    let router_to_publisher_weak = filtered_tx.downgrade();
 
     // Spawn the pipeline. Order matters only so the channels line
     // up; the tasks all run concurrently.
@@ -229,9 +241,15 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
         ws_reader::WsReaderOptions::default(),
         cursors.clone(),
         shutdown_rx.clone(),
+        metrics.clone(),
     );
+    // Capture the ws → decoder WeakSender and the state reader
+    // *before* `ws_reader` is moved into `decoder::spawn`.
+    let ws_to_decoder_weak = ws_reader.frames_weak();
+    let ws_state = ws_reader.state_reader();
 
-    let mut decoder_handle = decoder::spawn(ws_reader, cursors.clone(), event_tx);
+    let mut decoder_handle =
+        decoder::spawn(ws_reader, cursors.clone(), event_tx, metrics.clone());
 
     let mut router_handle = router::spawn(
         router::RouterOptions {
@@ -251,12 +269,29 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
             cfg.publisher.on_oversize,
         ),
         filtered_rx,
+        metrics.clone(),
     );
 
     let mut persister_handle = cursor::spawn_persister(
         cursors.clone(),
         backend.clone(),
         Duration::from_secs(cfg.cursor.save_interval_seconds),
+    );
+
+    let metrics_emitter = metrics::spawn_emitter(
+        metrics.clone(),
+        metrics::ChannelGauges {
+            ws_to_decoder: ws_to_decoder_weak,
+            decoder_to_router: decoder_to_router_weak,
+            router_to_publisher: router_to_publisher_weak,
+        },
+        cursors.clone(),
+        ws_state,
+        backend.clone(),
+        cfg.redis.stream_key.clone(),
+        started_at,
+        Duration::from_secs(10),
+        shutdown_rx.clone(),
     );
 
     info!(
@@ -314,7 +349,8 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
     };
 
     // Flip the global shutdown so ws_reader bails immediately. The
-    // rest of the cascade unfolds through channel closes.
+    // rest of the cascade unfolds through channel closes. The
+    // metrics emitter also observes this watch and exits.
     let _ = shutdown_tx.send(true);
 
     // Drive the §3 cascade under a 30s total budget. If we overrun,
@@ -327,6 +363,7 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
             router_handle,
             publisher_handle,
             persister_handle,
+            metrics_emitter,
             cursors.clone(),
             backend.clone(),
         ),
@@ -346,16 +383,26 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
         }
     };
 
+    // `shutdown_metrics` payload per DESIGN.md §4. Totals come from
+    // the same atomic counters the periodic emitter samples, so there
+    // is exactly one source of truth for "how many events did we
+    // publish this run".
+    let totals = metrics.shutdown_totals();
+    let final_cursor_per_relay: std::collections::HashMap<String, u64> =
+        shutdown_result.final_cursors.iter().cloned().collect();
     info!(
         target: "horizon_firehose::metrics",
         event_type = "shutdown_metrics",
         uptime_seconds = started_at.elapsed().as_secs(),
         exit_reason = ?exit_reason,
-        decoder_stats = ?shutdown_result.decoder,
-        router_stats = ?shutdown_result.router,
-        publisher_result = ?shutdown_result.publisher,
-        persister_stats = ?shutdown_result.persister,
-        final_cursors = ?shutdown_result.final_cursors,
+        total_events_published = totals.total_events_published,
+        total_decode_errors = totals.total_decode_errors,
+        total_redis_errors = totals.total_redis_errors,
+        total_reconnects = totals.total_reconnects,
+        total_skipped_frames = totals.total_skipped_frames,
+        total_oversize_events = totals.total_oversize_events,
+        total_unknown_frame_types = totals.total_unknown_frame_types,
+        final_cursor_per_relay = %serde_json::to_string(&final_cursor_per_relay).unwrap_or_default(),
         "shutdown complete"
     );
 
@@ -376,15 +423,14 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
     Ok(())
 }
 
-/// Aggregated shutdown result passed back to `run_async`.
+/// Aggregated shutdown result passed back to `run_async`. Only the
+/// publisher's Result and the final cursor snapshot are surfaced —
+/// the cumulative stats for decoder/router/publisher/persister live
+/// on the shared [`metrics::Metrics`] and are read via
+/// `metrics.shutdown_totals()` for the `shutdown_metrics` event.
 #[derive(Debug)]
 struct ShutdownResult {
-    decoder: decoder::DecoderStats,
-    router: router::RouterStats,
     publisher: Result<publisher::PublisherStats, publisher::PublisherError>,
-    persister: cursor::PersisterStats,
-    /// Snapshot of every known (relay, seq) after the final cursor
-    /// flush; useful as the `shutdown_metrics` payload per §4.
     final_cursors: Vec<(String, u64)>,
 }
 
@@ -393,21 +439,23 @@ struct ShutdownResult {
 /// watch doesn't stop them from publishing buffered events — channel
 /// close is what drives exit, and channel close only happens when the
 /// previous stage has finished draining. Exactly the §3 ordering.
+#[allow(clippy::too_many_arguments)]
 async fn shutdown_cascade<B: StreamBackend>(
     decoder_h: decoder::DecoderHandle,
     router_h: router::RouterHandle,
     publisher_h: publisher::PublisherHandle,
     persister_h: cursor::PersisterHandle,
+    metrics_emitter_h: metrics::EmitterHandle,
     cursors: Cursors,
     backend: Arc<B>,
 ) -> ShutdownResult {
     // Decoder sees the ws_reader's frames channel close (ws_reader
     // bailed on shutdown signal), drains any buffered frames, closes
     // its event channel downstream.
-    let decoder_stats = decoder_h.join().await;
+    let _decoder_stats = decoder_h.join().await;
     // Router sees the event channel close, drains, closes filtered
     // channel.
-    let router_stats = router_h.shutdown().await;
+    let _router_stats = router_h.shutdown().await;
     // Publisher sees the filtered channel close, drains (with Redis
     // retry as needed), closes. join() (not shutdown()) because we
     // want to let mid-flight retries resolve rather than abort them.
@@ -428,13 +476,16 @@ async fn shutdown_cascade<B: StreamBackend>(
     let final_cursors = cursors.snapshot().await;
 
     // Stop the periodic persister now that we've done the final write.
-    let persister_stats = persister_h.shutdown().await;
+    let _persister_stats = persister_h.shutdown().await;
+
+    // Metrics emitter is *not* in the pipeline cascade — it observes
+    // the global shutdown watch directly. By the time we get here
+    // it's already exited (the `select!` above flipped the watch).
+    // Just join so we don't leave a task orphaned.
+    metrics_emitter_h.join().await;
 
     ShutdownResult {
-        decoder: decoder_stats,
-        router: router_stats,
         publisher: publisher_result,
-        persister: persister_stats,
         final_cursors,
     }
 }

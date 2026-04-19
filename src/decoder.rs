@@ -22,6 +22,8 @@
 //! `on_stale_cursor` config.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use proto_blue_lex_cbor::{CborError, decode, decode_all};
 use proto_blue_lex_data::{Cid, LexValue};
@@ -36,6 +38,7 @@ use crate::event::{
     AccountEvent, CommitEvent, Event, HandleEvent, IdentityEvent, Operation,
     TombstoneEvent,
 };
+use crate::metrics::Metrics;
 use crate::ws_reader::WsReader;
 
 /// Top-level result of decoding one binary frame.
@@ -502,6 +505,7 @@ pub fn spawn(
     mut reader: WsReader,
     cursors: Cursors,
     event_tx: mpsc::Sender<(Event, u64)>,
+    metrics: Arc<Metrics>,
 ) -> DecoderHandle {
     let task = tokio::spawn(async move {
         let mut stats = DecoderStats::default();
@@ -519,6 +523,7 @@ pub fn spawn(
                 }
                 Ok(DecodedFrame::Skipped { kind, seq }) => {
                     stats.skipped_frames += 1;
+                    metrics.skipped_frames_total.fetch_add(1, Ordering::Relaxed);
                     // Advance the cursor past the skipped frame so
                     // replay after restart doesn't re-see it forever.
                     // The §3 "republish to Redis" invariant is about
@@ -546,6 +551,17 @@ pub fn spawn(
                 }
                 Err(e) => {
                     stats.decode_errors += 1;
+                    metrics.decode_errors_total.fetch_add(1, Ordering::Relaxed);
+                    // `UnknownFrameType` is a distinct bucket (DESIGN.md
+                    // §3 "Frame types: handled vs known-skip vs
+                    // unknown") — count separately so operators can
+                    // alert on "ATProto added a frame type" without
+                    // alert fatigue from every corrupted CBOR frame.
+                    if matches!(e, DecodeError::UnknownFrameType(_)) {
+                        metrics
+                            .unknown_frame_types_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     // Log with a short hex prefix of the frame so an
                     // operator can correlate with a capture — without
                     // flooding the log with full frame bodies.
