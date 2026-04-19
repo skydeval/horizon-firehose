@@ -209,6 +209,8 @@ On SIGTERM or SIGINT:
 5. Cursor persister task: write the final cursor (which now reflects all XADDed events) to Redis
 6. All tasks exit, main joins them, emit `shutdown_metrics` event, process exits zero
 
+**Signal fan-out.** Only `ws_reader` observes the global shutdown signal directly. The downstream tasks (decoder, router, publisher, cursor persister) don't need to — they exit via their input channel closing, which only happens when the previous stage has finished draining. This gives §3's drain-first ordering "for free" without per-task shutdown logic, and keeps the coordinator's job narrow: flip one watch, then await each stage in order. The §3 "drain-first (biased select!)" subsection above explains why each stage's `tokio::select!` must prioritise input over shutdown for this to work.
+
 Total shutdown budget: 30 seconds. If exceeded, log at ERROR and force-exit non-zero — the cursor won't be perfectly accurate but we won't hang the orchestrator.
 
 ### reconnect duplication

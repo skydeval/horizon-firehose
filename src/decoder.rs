@@ -27,11 +27,16 @@ use proto_blue_lex_cbor::{CborError, decode, decode_all};
 use proto_blue_lex_data::{Cid, LexValue};
 use proto_blue_repo::read_car;
 use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
 
+use crate::cursor::Cursors;
 use crate::event::{
     AccountEvent, CommitEvent, Event, HandleEvent, IdentityEvent, Operation,
     TombstoneEvent,
 };
+use crate::ws_reader::WsReader;
 
 /// Top-level result of decoding one binary frame.
 #[derive(Debug)]
@@ -454,6 +459,122 @@ fn lex_kind(v: &LexValue) -> &'static str {
         LexValue::Array(_) => "array",
         LexValue::Map(_) => "map",
     }
+}
+
+// ─── Phase 5 pipeline task ─────────────────────────────────────────
+
+/// Counters collected by the decoder task, emitted when the task exits.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DecoderStats {
+    pub frames_in: u64,
+    pub events_out: u64,
+    pub decode_errors: u64,
+    pub skipped_frames: u64,
+    pub info_frames: u64,
+    pub outdated_cursors: u64,
+}
+
+/// Handle to a spawned decoder task.
+pub struct DecoderHandle {
+    pub(crate) task: JoinHandle<DecoderStats>,
+}
+
+impl DecoderHandle {
+    /// Await the task and return its cumulative stats. The task exits
+    /// when the upstream [`WsReader`] has been shut down (its frames
+    /// channel closes), at which point the decoder has already
+    /// forwarded everything it decoded.
+    pub async fn join(self) -> DecoderStats {
+        self.task.await.unwrap_or_default()
+    }
+}
+
+/// Spawn the decoder task. It pulls `(bytes, relay)` pairs from the
+/// `WsReader`, runs [`decode_frame`], and forwards republishable
+/// events downstream as `(Event, seq)`. Decode errors are counted and
+/// logged at WARN; `#sync` and other `Skipped` frames still advance
+/// the per-relay cursor even though nothing goes downstream — so
+/// long idle gaps on `#sync`-heavy relays don't stall restart
+/// replay. `OutdatedCursor` and other `#info` frames are currently
+/// logged and counted; acting on them (per-config) lands in a later
+/// phase.
+pub fn spawn(
+    mut reader: WsReader,
+    cursors: Cursors,
+    event_tx: mpsc::Sender<(Event, u64)>,
+) -> DecoderHandle {
+    let task = tokio::spawn(async move {
+        let mut stats = DecoderStats::default();
+
+        while let Some((bytes, relay)) = reader.recv().await {
+            stats.frames_in += 1;
+
+            match decode_frame(&bytes, &relay) {
+                Ok(DecodedFrame::Event { event, seq }) => {
+                    if event_tx.send((event, seq)).await.is_err() {
+                        debug!("decoder: downstream channel closed");
+                        break;
+                    }
+                    stats.events_out += 1;
+                }
+                Ok(DecodedFrame::Skipped { kind, seq }) => {
+                    stats.skipped_frames += 1;
+                    // Advance the cursor past the skipped frame so
+                    // replay after restart doesn't re-see it forever.
+                    // The §3 "republish to Redis" invariant is about
+                    // event-bearing frames; skipped frames by design
+                    // have no downstream entry.
+                    cursors.advance(&relay, seq).await;
+                    debug!(kind, seq, relay = %relay, "skipped frame; cursor advanced");
+                }
+                Ok(DecodedFrame::OutdatedCursor { message }) => {
+                    stats.outdated_cursors += 1;
+                    warn!(
+                        relay = %relay,
+                        message = ?message,
+                        "received OutdatedCursor from relay (policy handling is phase-next)",
+                    );
+                }
+                Ok(DecodedFrame::Info { name, message }) => {
+                    stats.info_frames += 1;
+                    info!(
+                        relay = %relay,
+                        info_name = %name,
+                        message = ?message,
+                        "relay info frame"
+                    );
+                }
+                Err(e) => {
+                    stats.decode_errors += 1;
+                    // Log with a short hex prefix of the frame so an
+                    // operator can correlate with a capture — without
+                    // flooding the log with full frame bodies.
+                    let hex_prefix = hex_prefix(&bytes, 32);
+                    warn!(
+                        relay = %relay,
+                        error = %e,
+                        frame_hex_prefix = %hex_prefix,
+                        "CBOR/CAR decode failed; dropping frame"
+                    );
+                }
+            }
+        }
+
+        debug!(?stats, "decoder task exiting");
+        stats
+    });
+
+    DecoderHandle { task }
+}
+
+fn hex_prefix(b: &[u8], n: usize) -> String {
+    let take = b.len().min(n);
+    let mut s = String::with_capacity(take * 2);
+    use std::fmt::Write;
+    for byte in &b[..take] {
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
 }
 
 #[cfg(test)]

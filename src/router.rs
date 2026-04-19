@@ -100,7 +100,7 @@ pub struct RouterStats {
 }
 
 pub struct RouterHandle {
-    task: JoinHandle<RouterStats>,
+    pub(crate) task: JoinHandle<RouterStats>,
     shutdown_tx: watch::Sender<bool>,
 }
 

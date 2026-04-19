@@ -107,7 +107,7 @@ pub struct PublisherStats {
 
 /// Handle to the spawned publisher task.
 pub struct PublisherHandle {
-    task: JoinHandle<Result<PublisherStats, PublisherError>>,
+    pub(crate) task: JoinHandle<Result<PublisherStats, PublisherError>>,
     shutdown_tx: watch::Sender<bool>,
 }
 

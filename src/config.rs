@@ -186,12 +186,6 @@ impl Config {
         Self::load_from_figment(Figment::new().merge(Toml::file(path)), Some(path))
     }
 
-    /// Build a Config purely from environment variables. Useful for
-    /// containerised deploys where every value comes from the env.
-    pub fn load_from_env() -> Result<Self> {
-        Self::load_from_figment(Figment::new(), None)
-    }
-
     fn load_from_figment(base: Figment, path: Option<&Path>) -> Result<Self> {
         let figment = base.merge(Env::prefixed("HORIZON_FIREHOSE_").split("__"));
         let cfg: Self = figment.extract().map_err(|source| Error::ConfigLoad {

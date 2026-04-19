@@ -57,20 +57,8 @@ impl Event {
         }
     }
 
-    pub fn to_json_string(&self) -> serde_json::Result<String> {
-        serde_json::to_string(self)
-    }
-
     pub fn to_json_bytes(&self) -> serde_json::Result<Vec<u8>> {
         serde_json::to_vec(self)
-    }
-
-    /// Approximate serialised JSON length in bytes. For Phase 3 this is
-    /// an exact serialise-and-measure; Phase 4's oversize check will
-    /// reuse the actual serialisation it has to do anyway, so an
-    /// estimator that avoids the work isn't valuable yet.
-    pub fn estimated_serialized_size(&self) -> usize {
-        self.to_json_bytes().map(|v| v.len()).unwrap_or(0)
     }
 }
 
@@ -182,13 +170,4 @@ mod tests {
         assert!(v["handle"].is_null());
     }
 
-    #[test]
-    fn estimated_size_matches_serialised_length() {
-        let ev = Event::Tombstone(TombstoneEvent {
-            did: "did:plc:abc".into(),
-            relay: "ws://r".into(),
-        });
-        let bytes = ev.to_json_bytes().unwrap();
-        assert_eq!(ev.estimated_serialized_size(), bytes.len());
-    }
 }

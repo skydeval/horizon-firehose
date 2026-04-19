@@ -1,74 +1,80 @@
 //! horizon-firehose entry point.
 //!
-//! Phase 1 scope (per DESIGN.md §6): load config, initialise tracing,
-//! emit `startup_metrics`, wait for SIGINT/SIGTERM, emit a shutdown
-//! event, exit zero. Subsequent phases bolt the actual pipeline tasks
-//! (ws reader, decoder, publisher, cursor persister) onto this scaffold.
+// The binary build never exercises the fake backend, the internal
+// `ws_reader::spawn` variant, or the publisher's mid-retry
+// `shutdown()` path — those are for unit tests. Suppressing
+// dead_code only in the non-test build keeps those items alive for
+// their test users without masking genuinely dead items in CI
+// (where tests run).
+#![cfg_attr(not(test), allow(dead_code))]
 
-// Phase 1 only wires a subset of the config + error surface into `main`;
-// the rest is consumed by later-phase modules. Anything still unused at
-// the v1 cut should be deleted, not annotated.
-//
-// TODO: remove these `#[allow(dead_code)]` once the rustc ICE below is
-// fixed *and* every field has a real consumer.
-//
-// rustc 1.95.0 ICEs while emitting a dead_code warning for these
-// modules — `StyledBuffer::replace` in annotate-snippets panics with
-// "slice index starts at N but ends at M" when --diagnostic-width is
-// auto-detected as 0 (which cargo does under non-TTY invocations like
-// WSL-from-Windows-bash). See:
-//   https://github.com/rust-lang/rust/issues/154258
-//   https://github.com/rust-lang/rust/pull/154914 (fix; not in 1.95.0)
-#[allow(dead_code)]
-mod config;
-#[allow(dead_code)]
-mod error;
-// Phase 2 module — declared so cargo compiles and tests it. The
-// pipeline integration (calling `ws_reader::spawn` from `run`) lands in
-// a later phase when the decoder + publisher tasks exist to wire to.
-#[allow(dead_code)]
-mod ws_reader;
-// Phase 3 modules — same story: compiled and tested in isolation,
-// wired into the pipeline later.
-#[allow(dead_code)]
-mod decoder;
-#[allow(dead_code)]
-mod event;
-// Phase 4 modules — router, publisher, cursor, plus the storage
-// backend abstraction they share. Tested in isolation against an
-// in-memory fake; Phase 5 wires them together in `run`.
-#[allow(dead_code)]
+//! Phase 5 scope (per DESIGN.md §6): wire every module into a running
+//! pipeline, coordinate DESIGN.md §3 shutdown ordering, detect task
+//! panics, fail open on transient Redis outages at startup. What the
+//! binary does now:
+//!
+//! 1. Load + validate config, initialise tracing, emit
+//!    `startup_metrics`.
+//! 2. Install a global shutdown watch driven by SIGINT/SIGTERM.
+//! 3. Connect to Redis with indefinite exponential backoff, aborting
+//!    cleanly if a shutdown signal fires during startup.
+//! 4. Load any previously-persisted cursors so failover can resume
+//!    from our last XADD, not live tip.
+//! 5. Spawn five tasks — ws_reader, decoder, router, publisher,
+//!    cursor persister — wired via bounded mpsc channels.
+//! 6. Block until *either* a shutdown signal *or* a task exits
+//!    unexpectedly (panic / unrecoverable error).
+//! 7. Drive the §3 shutdown cascade: flip the global signal, await
+//!    each task in order. Budget: 30 seconds total; force-exit
+//!    non-zero on overrun.
+//! 8. Flush cursors one last time so the final persisted value
+//!    reflects every XADDed event (required by §3 ordering).
+//! 9. Emit `shutdown_metrics`, exit zero on clean shutdown, non-zero
+//!    on panic or budget overrun.
+
 mod backend;
-#[allow(dead_code)]
+mod config;
 mod cursor;
-#[allow(dead_code)]
+mod decoder;
+mod error;
+mod event;
 mod publisher;
-#[allow(dead_code)]
 mod router;
-// End-to-end pipeline test. Lives in its own module because it
-// spans decoder → router → publisher → backend and doesn't belong
-// to any one of them.
+mod ws_reader;
 #[cfg(test)]
 mod pipeline_test;
+#[cfg(test)]
+mod pipeline_main_test;
 
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tracing::{error, info};
+use tokio::sync::{mpsc, watch};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::backend::{RedisBackend, StreamBackend};
 use crate::config::{Config, LogFormat};
+use crate::cursor::Cursors;
 use crate::error::Error;
 
 /// Compile-time consumer version, surfaced in `startup_metrics`.
 const CONSUMER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// DESIGN.md §3 shutdown budget.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
+
+/// Default channel buffer between pipeline tasks. Tunable later.
+const CHANNEL_BUFFER: usize = 1024;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // Tracing may not be initialised yet (config could fail before
-            // we set up subscribers), so emit on stderr too.
+            // Tracing may not be initialised yet (config could fail
+            // before we set up subscribers), so emit on stderr too.
             eprintln!("fatal: {err}");
             error!(error = %err, "horizon-firehose exiting non-zero");
             ExitCode::FAILURE
@@ -79,6 +85,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Error> {
     let path = Config::resolve_path();
     let cfg = Config::load(&path)?;
+    validate_tls_extra_ca(&cfg)?;
 
     init_tracing(&cfg);
     emit_startup_metrics(&cfg, &path);
@@ -87,15 +94,7 @@ fn run() -> Result<(), Error> {
         .enable_all()
         .build()?;
 
-    runtime.block_on(idle_until_shutdown());
-
-    info!(
-        target: "horizon_firehose::metrics",
-        event_type = "shutdown_metrics",
-        uptime_seconds = 0,
-        "shutdown complete"
-    );
-    Ok(())
+    runtime.block_on(run_async(cfg))
 }
 
 fn init_tracing(cfg: &Config) {
@@ -117,11 +116,43 @@ fn init_tracing(cfg: &Config) {
     }
 }
 
-/// Emit the startup_metrics event per DESIGN.md §4.
+/// Check that `relay.tls_extra_ca_file` (if set) points at a readable
+/// file before we start long-running work. Fails fast on typos.
 ///
-/// Only the explicit allowlist of fields is included. Credentials and
-/// credential-adjacent values (passwords, full Redis URLs with userinfo)
-/// are never emitted.
+/// **Limitation**: proto-blue-ws uses `tokio_tungstenite::connect_async`
+/// under the hood, which takes no `ClientConfig`, so this CA bundle
+/// is not currently plumbed into the actual TLS handshake. Phase 5
+/// validates the file so operators know the path is wrong *at
+/// startup* rather than discovering it only after proto-blue-ws
+/// grows a `connect_async_tls_with_config` path. See DESIGN.md §3
+/// "TLS verification" — the additive-CA config is accepted but
+/// inert until upstream exposes the config hook.
+///
+/// See upstream feature request at
+/// <https://github.com/dollspace-gay/proto-blue/issues/4> for
+/// tracking. When proto-blue-ws exposes a rustls `ClientConfig`
+/// hook, this validation step becomes the first half of actual CA
+/// injection (load + parse the PEM → install as additive roots on
+/// the `ClientConfig` passed to `connect_async_tls_with_config`).
+fn validate_tls_extra_ca(cfg: &Config) -> Result<(), Error> {
+    let path = cfg.relay.tls_extra_ca_file.trim();
+    if path.is_empty() {
+        return Ok(());
+    }
+    let p = std::path::PathBuf::from(path);
+    match std::fs::metadata(&p) {
+        Ok(_) => {
+            warn!(
+                path = %p.display(),
+                "relay.tls_extra_ca_file is set but not plumbed through to proto-blue-ws; \
+                 file is validated for existence, not loaded into the TLS stack yet"
+            );
+            Ok(())
+        }
+        Err(source) => Err(Error::TlsExtraCaFile { path: p, source }),
+    }
+}
+
 fn emit_startup_metrics(cfg: &Config, path: &std::path::Path) {
     let payload = json!({
         "type": "startup_metrics",
@@ -143,9 +174,282 @@ fn emit_startup_metrics(cfg: &Config, path: &std::path::Path) {
     );
 }
 
-/// Phase 1 has no pipeline yet — we just block on shutdown signals so
-/// the binary behaves like a real service for smoke testing.
-async fn idle_until_shutdown() {
+async fn run_async(cfg: Config) -> Result<(), Error> {
+    let started_at = Instant::now();
+
+    // Global shutdown signal: one watch, cloned everywhere.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(listen_for_signals(shutdown_tx.clone()));
+
+    // Redis connect with indefinite retry. If a signal fires first,
+    // we unwind cleanly without ever having started the pipeline.
+    let backend = match RedisBackend::connect_with_retry(
+        &cfg.redis.url,
+        Duration::from_millis(500),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        shutdown_rx.clone(),
+    )
+    .await
+    {
+        Ok(Some(b)) => Arc::new(b),
+        Ok(None) => {
+            info!("shutdown signal received during Redis startup retry; exiting clean");
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(Error::TaskFailure {
+                task: "redis_startup",
+                message: err.to_string(),
+            });
+        }
+    };
+
+    // Load persisted cursors so each relay resumes where we left off.
+    // Best-effort: a transient Redis hiccup here logs WARN but doesn't
+    // block startup — we'd just resume from live tip, which is the
+    // documented §3 behaviour for "no prior cursor".
+    let all_relays: Vec<String> = std::iter::once(cfg.relay.url.clone())
+        .chain(cfg.relay.fallbacks.iter().cloned())
+        .collect();
+    let cursors = Cursors::new();
+    if let Err(err) = cursors.load_initial(backend.as_ref(), &all_relays).await {
+        warn!(error = %err, "failed to load cursors at startup; resuming from live tip");
+    }
+
+    // Channels between pipeline stages. All bounded — backpressure
+    // cascades upstream to the relay if a downstream stage stalls.
+    let (event_tx, event_rx) = mpsc::channel::<(event::Event, u64)>(CHANNEL_BUFFER);
+    let (filtered_tx, filtered_rx) = mpsc::channel::<(event::Event, u64)>(CHANNEL_BUFFER);
+
+    // Spawn the pipeline. Order matters only so the channels line
+    // up; the tasks all run concurrently.
+    let ws_reader = ws_reader::spawn_with_cursors(
+        cfg.relay.clone(),
+        ws_reader::WsReaderOptions::default(),
+        cursors.clone(),
+        shutdown_rx.clone(),
+    );
+
+    let mut decoder_handle = decoder::spawn(ws_reader, cursors.clone(), event_tx);
+
+    let mut router_handle = router::spawn(
+        router::RouterOptions {
+            record_types: cfg.filter.record_types.clone(),
+        },
+        event_rx,
+        filtered_tx,
+    );
+
+    let mut publisher_handle = publisher::spawn(
+        backend.clone(),
+        cursors.clone(),
+        publisher::PublisherOptions::with_defaults(
+            cfg.redis.stream_key.clone(),
+            cfg.redis.max_stream_len,
+            cfg.publisher.max_event_size_bytes,
+            cfg.publisher.on_oversize,
+        ),
+        filtered_rx,
+    );
+
+    let mut persister_handle = cursor::spawn_persister(
+        cursors.clone(),
+        backend.clone(),
+        Duration::from_secs(cfg.cursor.save_interval_seconds),
+    );
+
+    info!(
+        target: "horizon_firehose::metrics",
+        event_type = "pipeline_started",
+        relay_primary = %cfg.relay.url,
+        channel_buffer = CHANNEL_BUFFER,
+        "pipeline running"
+    );
+
+    // Wait for the first of: explicit shutdown signal, OR any pipeline
+    // task exiting unexpectedly (panic / unrecoverable error / its
+    // upstream channel vanishing).
+    //
+    // `JoinHandle<T>` is `Unpin`, so `&mut handle` is itself a
+    // `Future`. Polling it in `select!` detects task completion —
+    // normal exit *or* panic — without consuming the handle, so we
+    // can still call `join()` on it in the cascade below to collect
+    // each task's stats. Do **not** "simplify" by moving the handle
+    // into the select arm: that would drop the handle after the first
+    // poll and lose our ability to (a) distinguish panic vs clean
+    // exit via `JoinError` in the error path, and (b) surface
+    // per-task stats in the final `shutdown_metrics` event.
+    let mut shutdown_rx_ev = shutdown_rx.clone();
+    let exit_reason: ExitReason = tokio::select! {
+        _ = shutdown_rx_ev.changed() => ExitReason::Signal,
+        r = &mut decoder_handle.task => ExitReason::TaskEnded {
+            name: "decoder",
+            panicked: r.is_err(),
+        },
+        r = &mut router_handle.task => ExitReason::TaskEnded {
+            name: "router",
+            panicked: r.is_err(),
+        },
+        r = &mut publisher_handle.task => ExitReason::TaskEnded {
+            name: "publisher",
+            panicked: r.is_err(),
+        },
+        r = &mut persister_handle.task => ExitReason::TaskEnded {
+            name: "cursor_persister",
+            panicked: r.is_err(),
+        },
+    };
+
+    let fault = match &exit_reason {
+        ExitReason::Signal => None,
+        ExitReason::TaskEnded { name, panicked } => {
+            if *panicked {
+                error!(task = name, "pipeline task panicked — initiating shutdown");
+            } else {
+                error!(task = name, "pipeline task exited unexpectedly — initiating shutdown");
+            }
+            Some(*name)
+        }
+    };
+
+    // Flip the global shutdown so ws_reader bails immediately. The
+    // rest of the cascade unfolds through channel closes.
+    let _ = shutdown_tx.send(true);
+
+    // Drive the §3 cascade under a 30s total budget. If we overrun,
+    // force-exit non-zero — cursor accuracy is best-effort on overrun
+    // but the orchestrator shouldn't hang.
+    let shutdown_outcome = tokio::time::timeout(
+        SHUTDOWN_BUDGET,
+        shutdown_cascade(
+            decoder_handle,
+            router_handle,
+            publisher_handle,
+            persister_handle,
+            cursors.clone(),
+            backend.clone(),
+        ),
+    )
+    .await;
+
+    let shutdown_result = match shutdown_outcome {
+        Ok(result) => result,
+        Err(_timeout) => {
+            error!(
+                target: "horizon_firehose::metrics",
+                event_type = "shutdown_budget_exceeded",
+                budget_secs = SHUTDOWN_BUDGET.as_secs(),
+                "graceful shutdown did not complete in budget; forcing exit"
+            );
+            return Err(Error::ShutdownBudgetExceeded);
+        }
+    };
+
+    info!(
+        target: "horizon_firehose::metrics",
+        event_type = "shutdown_metrics",
+        uptime_seconds = started_at.elapsed().as_secs(),
+        exit_reason = ?exit_reason,
+        decoder_stats = ?shutdown_result.decoder,
+        router_stats = ?shutdown_result.router,
+        publisher_result = ?shutdown_result.publisher,
+        persister_stats = ?shutdown_result.persister,
+        final_cursors = ?shutdown_result.final_cursors,
+        "shutdown complete"
+    );
+
+    // A task fault → non-zero exit so the orchestrator restarts us.
+    if let Some(task) = fault {
+        return Err(Error::TaskFailure {
+            task,
+            message: format!("task '{task}' exited before shutdown signal"),
+        });
+    }
+    // A publisher `fail_hard` oversize error also counts as non-zero.
+    if let Err(err) = shutdown_result.publisher {
+        return Err(Error::TaskFailure {
+            task: "publisher",
+            message: err.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Aggregated shutdown result passed back to `run_async`.
+#[derive(Debug)]
+struct ShutdownResult {
+    decoder: decoder::DecoderStats,
+    router: router::RouterStats,
+    publisher: Result<publisher::PublisherStats, publisher::PublisherError>,
+    persister: cursor::PersisterStats,
+    /// Snapshot of every known (relay, seq) after the final cursor
+    /// flush; useful as the `shutdown_metrics` payload per §4.
+    final_cursors: Vec<(String, u64)>,
+}
+
+/// Drive the §3 cascade: drain each stage before draining the next.
+/// Tasks have drain-first `biased;` selects, so signalling the global
+/// watch doesn't stop them from publishing buffered events — channel
+/// close is what drives exit, and channel close only happens when the
+/// previous stage has finished draining. Exactly the §3 ordering.
+async fn shutdown_cascade<B: StreamBackend>(
+    decoder_h: decoder::DecoderHandle,
+    router_h: router::RouterHandle,
+    publisher_h: publisher::PublisherHandle,
+    persister_h: cursor::PersisterHandle,
+    cursors: Cursors,
+    backend: Arc<B>,
+) -> ShutdownResult {
+    // Decoder sees the ws_reader's frames channel close (ws_reader
+    // bailed on shutdown signal), drains any buffered frames, closes
+    // its event channel downstream.
+    let decoder_stats = decoder_h.join().await;
+    // Router sees the event channel close, drains, closes filtered
+    // channel.
+    let router_stats = router_h.shutdown().await;
+    // Publisher sees the filtered channel close, drains (with Redis
+    // retry as needed), closes. join() (not shutdown()) because we
+    // want to let mid-flight retries resolve rather than abort them.
+    let publisher_result = publisher_h.join().await;
+
+    // One last cursor flush AFTER the publisher has drained — this
+    // is the final "last XADDed seq" write required by §3. Doing it
+    // here means the persister's periodic ticks can have missed the
+    // last few advances without risk.
+    let outcome = cursors.persist_all(backend.as_ref()).await;
+    if outcome.failed > 0 {
+        warn!(
+            written = outcome.written,
+            failed = outcome.failed,
+            "final cursor flush had failures; proceeding to exit"
+        );
+    }
+    let final_cursors = cursors.snapshot().await;
+
+    // Stop the periodic persister now that we've done the final write.
+    let persister_stats = persister_h.shutdown().await;
+
+    ShutdownResult {
+        decoder: decoder_stats,
+        router: router_stats,
+        publisher: publisher_result,
+        persister: persister_stats,
+        final_cursors,
+    }
+}
+
+#[derive(Debug)]
+enum ExitReason {
+    Signal,
+    TaskEnded {
+        name: &'static str,
+        panicked: bool,
+    },
+}
+
+/// Listen for SIGINT/SIGTERM and flip the shared shutdown watch.
+async fn listen_for_signals(tx: watch::Sender<bool>) {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             error!(error = %err, "failed to listen for ctrl-c");
@@ -173,4 +477,5 @@ async fn idle_until_shutdown() {
         _ = ctrl_c => info!(signal = "SIGINT", "shutdown_initiated"),
         _ = term   => info!(signal = "SIGTERM", "shutdown_initiated"),
     }
+    let _ = tx.send(true);
 }

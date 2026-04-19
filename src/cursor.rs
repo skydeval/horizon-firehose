@@ -141,7 +141,7 @@ pub fn cursor_key(relay_url: &str) -> String {
 
 /// Handle to a spawned persister task.
 pub struct PersisterHandle {
-    task: JoinHandle<PersisterStats>,
+    pub(crate) task: JoinHandle<PersisterStats>,
     shutdown_tx: watch::Sender<bool>,
 }
 

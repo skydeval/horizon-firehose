@@ -32,6 +32,11 @@
 //! selection algorithm again. ATProto firehose traffic is continuous
 //! (~1500 events/sec), so any silence longer than `read_timeout` is
 //! genuinely degraded operation and should be treated as a failure.
+//!
+//! Upstream tracking: <https://github.com/dollspace-gay/proto-blue/issues/3>.
+//! If proto-blue-ws grows a way to surface reconnect attempts (or a
+//! bounded-retry mode) this wrapper can shrink to just the
+//! supervisor bookkeeping.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -43,6 +48,13 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::config::RelayConfig;
+use crate::cursor::Cursors;
+
+/// One raw WebSocket frame plus the relay URL it came from. The decoder
+/// stamps each decoded event with this so the publisher (and the
+/// per-relay cursor tracker) knows which relay's sequence number
+/// advanced.
+pub type Frame = (Vec<u8>, String);
 
 /// Cap on the rolling reconnect-history ring buffer. At normal rates
 /// (a handful of reconnects per hour) this is wildly over-provisioned;
@@ -94,10 +106,6 @@ struct RelayState {
     consecutive_failures: u32,
     last_failed_at: Option<Instant>,
     cooldown_until: Option<Instant>,
-    /// Phase 2 only tracks this — Phase 4 (cursor module) is what
-    /// actually persists it. Kept here so failover preserves the
-    /// per-relay last-known sequence across switches.
-    last_cursor: Option<u64>,
 }
 
 impl RelayState {
@@ -107,7 +115,6 @@ impl RelayState {
             consecutive_failures: 0,
             last_failed_at: None,
             cooldown_until: None,
-            last_cursor: None,
         }
     }
 
@@ -116,13 +123,14 @@ impl RelayState {
     }
 }
 
-/// Caller-visible snapshot of one relay's state.
+/// Caller-visible snapshot of one relay's state. Cursor tracking lives
+/// in [`crate::cursor::Cursors`] now; it's shared across ws_reader and
+/// publisher so there's no per-relay cursor stored on these snapshots.
 #[derive(Debug, Clone)]
 pub struct RelayStateSnapshot {
     pub url: String,
     pub consecutive_failures: u32,
     pub cooldown_until: Option<Instant>,
-    pub last_cursor: Option<u64>,
 }
 
 /// Counters surfaced to the caller (and ultimately to `metrics.rs`).
@@ -228,24 +236,31 @@ impl SharedState {
                 url: r.url.clone(),
                 consecutive_failures: r.consecutive_failures,
                 cooldown_until: r.cooldown_until,
-                last_cursor: r.last_cursor,
             })
             .collect()
     }
 }
 
 /// Caller-facing handle to the spawned supervisor task.
+///
+/// When built via [`spawn`] the handle also owns an internal
+/// `shutdown_tx` so [`shutdown`][Self::shutdown] can flip the signal.
+/// When built via [`spawn_with_cursors`] the caller owns the shutdown
+/// sender externally — the handle is purely a receiver + task-join
+/// — so [`shutdown`][Self::shutdown] only awaits the task (the
+/// shutdown signal must be raised by the caller).
 pub struct WsReader {
-    frames_rx: mpsc::Receiver<Vec<u8>>,
-    task: JoinHandle<()>,
-    shutdown_tx: watch::Sender<bool>,
+    frames_rx: mpsc::Receiver<Frame>,
+    pub(crate) task: JoinHandle<()>,
+    shutdown_tx: Option<watch::Sender<bool>>,
     state: Arc<Mutex<SharedState>>,
 }
 
 impl WsReader {
-    /// Receive the next raw frame. Returns `None` once the supervisor
-    /// has exited and the channel is drained.
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+    /// Receive the next raw frame together with the relay URL it came
+    /// from. Returns `None` once the supervisor has exited and the
+    /// channel is drained.
+    pub async fn recv(&mut self) -> Option<Frame> {
         self.frames_rx.recv().await
     }
 
@@ -257,18 +272,52 @@ impl WsReader {
         self.state.lock().unwrap().snapshot()
     }
 
-    /// Signal shutdown and wait for the supervisor task to exit.
-    /// The active connection is dropped without a close handshake
-    /// (TCP RST is acceptable per DESIGN.md §3 shutdown ordering).
+    /// Signal shutdown (if the handle owns its shutdown sender) and
+    /// wait for the supervisor task to exit. The active connection is
+    /// dropped without a close handshake — TCP RST is acceptable per
+    /// DESIGN.md §3 shutdown ordering.
     pub async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(true);
+        }
         let _ = self.task.await;
     }
 }
 
+/// Spawn the supervisor with no saved cursors and an internal
+/// shutdown-watch channel. Used by phase 2 tests that predate the
+/// Phase 4 cursor tracker and the Phase 5 global-shutdown wiring.
 pub fn spawn(cfg: RelayConfig, opts: WsReaderOptions) -> WsReader {
-    let (frames_tx, frames_rx) = mpsc::channel(opts.frame_buffer);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    spawn_internal(cfg, opts, Cursors::new(), shutdown_rx, Some(shutdown_tx))
+}
+
+/// Spawn the supervisor against an **external** shutdown watch. Used
+/// by the Phase 5 coordinator in `main`: one global shutdown signal
+/// fans out to every task, and the coordinator drives the DESIGN.md
+/// §3 shutdown cascade by flipping that single watch.
+///
+/// `cursors` is shared with the publisher. On each connect/reconnect,
+/// the supervisor reads the current cursor for the chosen relay and
+/// appends `?cursor=N` so the relay resumes from our last-confirmed
+/// XADD.
+pub fn spawn_with_cursors(
+    cfg: RelayConfig,
+    opts: WsReaderOptions,
+    cursors: Cursors,
+    shutdown_rx: watch::Receiver<bool>,
+) -> WsReader {
+    spawn_internal(cfg, opts, cursors, shutdown_rx, None)
+}
+
+fn spawn_internal(
+    cfg: RelayConfig,
+    opts: WsReaderOptions,
+    cursors: Cursors,
+    shutdown_rx: watch::Receiver<bool>,
+    shutdown_tx: Option<watch::Sender<bool>>,
+) -> WsReader {
+    let (frames_tx, frames_rx) = mpsc::channel(opts.frame_buffer);
     let state = Arc::new(Mutex::new(SharedState::from_config(&cfg)));
     let task = tokio::spawn(supervisor(
         cfg,
@@ -276,6 +325,7 @@ pub fn spawn(cfg: RelayConfig, opts: WsReaderOptions) -> WsReader {
         frames_tx,
         shutdown_rx,
         state.clone(),
+        cursors,
     ));
     WsReader {
         frames_rx,
@@ -288,9 +338,10 @@ pub fn spawn(cfg: RelayConfig, opts: WsReaderOptions) -> WsReader {
 async fn supervisor(
     cfg: RelayConfig,
     opts: WsReaderOptions,
-    frames_tx: mpsc::Sender<Vec<u8>>,
+    frames_tx: mpsc::Sender<Frame>,
     mut shutdown_rx: watch::Receiver<bool>,
     state: Arc<Mutex<SharedState>>,
+    cursors: Cursors,
 ) {
     let initial_backoff = Duration::from_millis(cfg.reconnect_initial_delay_ms);
     let max_backoff = Duration::from_millis(cfg.reconnect_max_delay_ms);
@@ -328,7 +379,18 @@ async fn supervisor(
             }
         }
 
+        // Read the saved cursor (if any) for this relay and build the
+        // connection URL with a `?cursor=N` query param so the relay
+        // resumes from our last-confirmed position. Cursors are shared
+        // with the publisher, which advances them on XADD success —
+        // so any reconnect mid-stream picks up the latest.
+        let connect_url = match cursors.get(&url).await {
+            Some(seq) => format!("{}{}cursor={seq}", url, url_separator(&url)),
+            None => url.clone(),
+        };
+
         let outcome = run_one_connection(
+            &connect_url,
             &url,
             &opts,
             &state,
@@ -390,19 +452,25 @@ enum ConnectionOutcome {
     Error,
 }
 
+/// Drive one WebSocket connection attempt. `connect_url` may include
+/// a `?cursor=N` resume param (the WebSocket client sees this);
+/// `relay_label` is the canonical URL used for cursor lookups, log
+/// fields, and per-frame stamping.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_connection(
-    url: &str,
+    connect_url: &str,
+    relay_label: &str,
     opts: &WsReaderOptions,
     state: &Arc<Mutex<SharedState>>,
     idx: usize,
-    frames_tx: &mpsc::Sender<Vec<u8>>,
+    frames_tx: &mpsc::Sender<Frame>,
     shutdown_rx: &mut watch::Receiver<bool>,
     inner_max_secs: u64,
 ) -> ConnectionOutcome {
-    info!(relay = %url, "connecting to relay");
+    info!(relay = %relay_label, connect_url = %connect_url, "connecting to relay");
 
     let mut ws = WebSocketKeepAlive::new(
-        url,
+        connect_url,
         WebSocketKeepAliveOpts {
             max_reconnect_seconds: inner_max_secs,
             heartbeat_interval_ms: opts.heartbeat_interval_ms,
@@ -415,7 +483,7 @@ async fn run_one_connection(
         r = ws.connect() => r,
     };
     if let Err(e) = connect_res {
-        warn!(relay = %url, error = %e, "initial connect failed");
+        warn!(relay = %relay_label, error = %e, "initial connect failed");
         return ConnectionOutcome::ConnectFailed;
     }
 
@@ -427,7 +495,7 @@ async fn run_one_connection(
     info!(
         target: "horizon_firehose::metrics",
         event_type = "relay_connected",
-        relay = %url,
+        relay = %relay_label,
         total_reconnects_since_start = metrics.total_reconnects_since_start,
         reconnects_last_hour = metrics.reconnects_last_hour,
         "relay connected"
@@ -447,7 +515,7 @@ async fn run_one_connection(
         let data = match result {
             Err(_) => {
                 warn!(
-                    relay = %url,
+                    relay = %relay_label,
                     timeout_secs = opts.read_timeout.as_secs(),
                     "no data within read_timeout; treating as failure"
                 );
@@ -455,11 +523,11 @@ async fn run_one_connection(
             }
             Ok(Ok(Some(data))) => data,
             Ok(Ok(None)) => {
-                info!(relay = %url, "server closed connection cleanly");
+                info!(relay = %relay_label, "server closed connection cleanly");
                 return ConnectionOutcome::CleanlyClosed;
             }
             Ok(Err(e)) => {
-                warn!(relay = %url, error = %e, "ws recv error");
+                warn!(relay = %relay_label, error = %e, "ws recv error");
                 return ConnectionOutcome::Error;
             }
         };
@@ -483,12 +551,20 @@ async fn run_one_connection(
         let send_res = tokio::select! {
             biased;
             _ = shutdown_rx.changed() => return ConnectionOutcome::Shutdown,
-            r = frames_tx.send(data) => r,
+            r = frames_tx.send((data, relay_label.to_string())) => r,
         };
         if send_res.is_err() {
             return ConnectionOutcome::DownstreamGone;
         }
     }
+}
+
+/// Pick the separator that keeps an existing query string valid. If
+/// the URL already has a `?`, we append with `&`; otherwise we start
+/// the query with `?`. Assumes `cursor` isn't already in the URL —
+/// the config validator rejects relay URLs that aren't clean.
+fn url_separator(url: &str) -> char {
+    if url.contains('?') { '&' } else { '?' }
 }
 
 #[cfg(test)]
@@ -696,8 +772,10 @@ mod tests {
             .await
             .expect("recv timed out")
             .expect("channel closed");
-        assert_eq!(f1, b"hello");
-        assert_eq!(f2, b"world");
+        assert_eq!(f1.0, b"hello");
+        assert_eq!(f1.1, server.url);
+        assert_eq!(f2.0, b"world");
+        assert_eq!(f2.1, server.url);
 
         let metrics = reader.metrics();
         assert_eq!(metrics.total_reconnects_since_start, 1);
@@ -722,7 +800,8 @@ mod tests {
             .await
             .expect("recv timed out")
             .expect("channel closed");
-        assert_eq!(frame, b"after-reconnect");
+        assert_eq!(frame.0, b"after-reconnect");
+        assert_eq!(frame.1, server.url);
 
         // Server should have accepted at least 2 connections.
         assert!(
@@ -754,7 +833,8 @@ mod tests {
             .await
             .expect("recv timed out")
             .expect("channel closed");
-        assert_eq!(frame, b"from-fallback");
+        assert_eq!(frame.0, b"from-fallback");
+        assert_eq!(frame.1, fallback.url);
 
         // Primary should have been hit at least failover_threshold times
         // before we gave up and switched.
@@ -835,7 +915,8 @@ mod tests {
             .await
             .expect("recv timed out")
             .expect("channel closed");
-        assert_eq!(frame, b"primary-recovered");
+        assert_eq!(frame.0, b"primary-recovered");
+        assert_eq!(frame.1, primary.url);
 
         // We should have ended up back on primary.
         assert_eq!(reader.metrics().active_relay.as_deref(), Some(primary.url.as_str()));

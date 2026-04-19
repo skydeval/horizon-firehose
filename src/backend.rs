@@ -125,6 +125,71 @@ impl RedisBackend {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
+
+    /// Connect with indefinite exponential backoff, checking `shutdown`
+    /// between attempts so SIGINT/SIGTERM still exits cleanly while
+    /// Redis is unreachable at startup. DESIGN.md §3 "Redis disconnect"
+    /// — we never exit on Redis outage; we wait it out.
+    ///
+    /// Returns `Ok(None)` if shutdown fired before connection
+    /// succeeded. Returns `Ok(Some(backend))` on success.
+    pub async fn connect_with_retry(
+        url: &str,
+        initial_backoff: std::time::Duration,
+        max_backoff: std::time::Duration,
+        warn_interval: std::time::Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Option<Self>, BackendError> {
+        let mut backoff = initial_backoff;
+        let started = std::time::Instant::now();
+        let mut last_warn: Option<std::time::Instant> = None;
+        let mut attempt: u64 = 0;
+
+        loop {
+            if *shutdown.borrow() {
+                return Ok(None);
+            }
+            attempt += 1;
+            match Self::connect(url).await {
+                Ok(b) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            attempts = attempt,
+                            total_wait_secs = started.elapsed().as_secs_f64(),
+                            "Redis connection established after retries"
+                        );
+                    }
+                    return Ok(Some(b));
+                }
+                Err(err) => {
+                    let now = std::time::Instant::now();
+                    let warn_due = match last_warn {
+                        None => true,
+                        Some(t) => now.duration_since(t) >= warn_interval,
+                    };
+                    if warn_due {
+                        tracing::warn!(
+                            target: "horizon_firehose::metrics",
+                            event_type = "redis_startup_retry",
+                            attempt,
+                            downtime_secs = started.elapsed().as_secs_f64(),
+                            next_backoff_ms = backoff.as_millis() as u64,
+                            error = %err,
+                            "Redis not reachable at startup; retrying"
+                        );
+                        last_warn = Some(now);
+                    }
+                }
+            }
+
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => return Ok(None),
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = backoff.saturating_mul(2).min(max_backoff);
+        }
+    }
 }
 
 impl StreamBackend for RedisBackend {
@@ -199,8 +264,6 @@ struct InMemoryState {
     next_id: u64,
     /// Controllable failure injection.
     fail_mode: FailMode,
-    /// How many XADDs we've successfully handled (observed by tests).
-    xadd_count: u64,
 }
 
 /// Faithful-enough Redis stand-in. See the module docs for fidelity
@@ -226,10 +289,6 @@ impl InMemoryBackend {
 
     pub async fn set_fail_mode(&self, mode: FailMode) {
         self.inner.lock().await.fail_mode = mode;
-    }
-
-    pub async fn xadd_count(&self) -> u64 {
-        self.inner.lock().await.xadd_count
     }
 
     /// Read all entries from a stream in insertion order — used to
@@ -302,7 +361,6 @@ impl StreamBackend for InMemoryBackend {
             entries.pop_front();
         }
 
-        state.xadd_count += 1;
         Ok(id)
     }
 
