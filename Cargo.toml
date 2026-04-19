@@ -52,12 +52,12 @@ chrono = "0.4"
 # to rustls.
 
 # proto-blue (pinned to commit SHA — see "Working with proto-blue" in README)
-proto-blue-api = { git = "https://github.com/dollspace-gay/proto-blue", rev = "c8acc1baa3017a205cc420cf58a4c5be8673fd39" }
-proto-blue-ws = { git = "https://github.com/dollspace-gay/proto-blue", rev = "c8acc1baa3017a205cc420cf58a4c5be8673fd39" }
-proto-blue-lex-cbor = { git = "https://github.com/dollspace-gay/proto-blue", rev = "c8acc1baa3017a205cc420cf58a4c5be8673fd39" }
-proto-blue-lex-data = { git = "https://github.com/dollspace-gay/proto-blue", rev = "c8acc1baa3017a205cc420cf58a4c5be8673fd39" }
-proto-blue-repo = { git = "https://github.com/dollspace-gay/proto-blue", rev = "c8acc1baa3017a205cc420cf58a4c5be8673fd39" }
-proto-blue-syntax = { git = "https://github.com/dollspace-gay/proto-blue", rev = "c8acc1baa3017a205cc420cf58a4c5be8673fd39" }
+proto-blue-api = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
+proto-blue-ws = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
+proto-blue-lex-cbor = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
+proto-blue-lex-data = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
+proto-blue-repo = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
+proto-blue-syntax = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
 
 # FutureExt::catch_unwind for the spawn_instrumented helper
 # (Phase 8.5 finding 2.1). Already in the tree as a transitive dep
@@ -100,15 +100,3 @@ strip = true
 # Faster incremental builds during development
 opt-level = 0
 debug = true
-
-# Temporary override: pins proto-blue to a fork with the
-# WebSocketTransport: Send + Sync trait supertrait fix.
-# Upstream PR filed at https://github.com/dollspace-gay/proto-blue/pull/5
-# Remove this [patch] block once upstream merges and we bump the pinned rev.
-[patch."https://github.com/dollspace-gay/proto-blue"]
-proto-blue-api = { git = "https://github.com/skydeval/proto-blue", branch = "fix-websockettransport-sync-supertrait" }
-proto-blue-ws = { git = "https://github.com/skydeval/proto-blue", branch = "fix-websockettransport-sync-supertrait" }
-proto-blue-lex-cbor = { git = "https://github.com/skydeval/proto-blue", branch = "fix-websockettransport-sync-supertrait" }
-proto-blue-lex-data = { git = "https://github.com/skydeval/proto-blue", branch = "fix-websockettransport-sync-supertrait" }
-proto-blue-repo = { git = "https://github.com/skydeval/proto-blue", branch = "fix-websockettransport-sync-supertrait" }
-proto-blue-syntax = { git = "https://github.com/skydeval/proto-blue", branch = "fix-websockettransport-sync-supertrait" }

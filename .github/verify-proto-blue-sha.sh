@@ -4,15 +4,10 @@
 # DESIGN.md round-3 finding F26 (catch force-pushes and silent drift).
 #
 # proto-blue ships as six crates from one repo. Cargo.lock records
-# each with its own `source` line. Normally:
+# each with its own `source` line of the form:
 #   source = "git+https://github.com/dollspace-gay/proto-blue?rev=<sha>#<sha>"
-# While a temporary `[patch]` override redirects to a fork (see
-# Cargo.toml for why):
-#   source = "git+https://github.com/<fork>/proto-blue?branch=<name>#<sha>"
-# We match either form and extract the SHA *after the `#`* — this
-# is the resolved commit Cargo actually compiles, regardless of the
-# declared pin shape. When the patch is dropped, the expected SHA
-# file should flip back to the upstream rev.
+# We extract every such line, confirm they all agree, and compare
+# against the expected SHA.
 #
 # Exit codes:
 #   0 — all proto-blue crates resolve to the expected SHA.
@@ -42,10 +37,9 @@ if [[ ! "$EXPECTED" =~ ^[a-f0-9]{40}$ ]]; then
 fi
 
 # Extract every proto-blue git source line from Cargo.lock, pull the
-# resolved SHA after `#` (works for both `?rev=…` upstream pins and
-# `?branch=…` fork-patch redirects), dedup. We expect one unique value.
-RESOLVED="$(grep -E '^source = "git\+https://github\.com/[^/]+/proto-blue[?#]' "$CARGO_LOCK" \
-    | sed -E 's/.*#([a-f0-9]{40}).*/\1/' \
+# SHA after `?rev=`, dedup. We expect one unique value.
+RESOLVED="$(grep -E '^source = "git\+https://github\.com/dollspace-gay/proto-blue\?rev=' "$CARGO_LOCK" \
+    | sed -E 's/.*\?rev=([a-f0-9]+)#.*/\1/' \
     | sort -u || true)"
 
 if [[ -z "$RESOLVED" ]]; then
