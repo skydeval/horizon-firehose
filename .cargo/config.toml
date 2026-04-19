@@ -1,0 +1,14 @@
+# Workaround for a rustc 1.95.0 ICE:
+#
+#   rustc panics in StyledBuffer::replace (annotate-snippets) when
+#   --diagnostic-width is auto-detected as 0, which happens on the
+#   WSL-from-Windows-bash invocations used for this project. The ICE
+#   only fires while *emitting* a dead_code warning, so it shows up
+#   when builds have any unused items — in practice, any time the
+#   bin target can't see cfg(test)-only usages.
+#
+# Setting rustflags here pins a sane diagnostic width crate-wide.
+# Once rustc grows the fix in https://github.com/rust-lang/rust/pull/154914
+# (not in 1.95.0) this can come out.
+[build]
+rustflags = ["--diagnostic-width=120"]

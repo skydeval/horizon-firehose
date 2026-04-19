@@ -104,6 +104,18 @@ pub trait StreamBackend: Send + Sync + 'static {
         &self,
         stream_key: &str,
     ) -> impl std::future::Future<Output = Result<u64, BackendError>> + Send;
+
+    /// Timestamp of the oldest entry in `stream_key`, or `Ok(None)` if
+    /// the stream is empty. Real Redis stream IDs are
+    /// `"<milliseconds>-<seq>"`; we parse the milliseconds half.
+    /// Used by the metrics emitter for the `oldest_event_age_seconds`
+    /// gauge in DESIGN.md §4.
+    fn oldest_event_timestamp(
+        &self,
+        stream_key: &str,
+    ) -> impl std::future::Future<
+        Output = Result<Option<chrono::DateTime<chrono::Utc>>, BackendError>,
+    > + Send;
 }
 
 // ─── Real Redis backend ────────────────────────────────────────────────
@@ -124,6 +136,71 @@ impl RedisBackend {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Connect with indefinite exponential backoff, checking `shutdown`
+    /// between attempts so SIGINT/SIGTERM still exits cleanly while
+    /// Redis is unreachable at startup. DESIGN.md §3 "Redis disconnect"
+    /// — we never exit on Redis outage; we wait it out.
+    ///
+    /// Returns `Ok(None)` if shutdown fired before connection
+    /// succeeded. Returns `Ok(Some(backend))` on success.
+    pub async fn connect_with_retry(
+        url: &str,
+        initial_backoff: std::time::Duration,
+        max_backoff: std::time::Duration,
+        warn_interval: std::time::Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Option<Self>, BackendError> {
+        let mut backoff = initial_backoff;
+        let started = std::time::Instant::now();
+        let mut last_warn: Option<std::time::Instant> = None;
+        let mut attempt: u64 = 0;
+
+        loop {
+            if *shutdown.borrow() {
+                return Ok(None);
+            }
+            attempt += 1;
+            match Self::connect(url).await {
+                Ok(b) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            attempts = attempt,
+                            total_wait_secs = started.elapsed().as_secs_f64(),
+                            "Redis connection established after retries"
+                        );
+                    }
+                    return Ok(Some(b));
+                }
+                Err(err) => {
+                    let now = std::time::Instant::now();
+                    let warn_due = match last_warn {
+                        None => true,
+                        Some(t) => now.duration_since(t) >= warn_interval,
+                    };
+                    if warn_due {
+                        tracing::warn!(
+                            target: "horizon_firehose::metrics",
+                            event_type = "redis_startup_retry",
+                            attempt,
+                            downtime_secs = started.elapsed().as_secs_f64(),
+                            next_backoff_ms = backoff.as_millis() as u64,
+                            error = %err,
+                            "Redis not reachable at startup; retrying"
+                        );
+                        last_warn = Some(now);
+                    }
+                }
+            }
+
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => return Ok(None),
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = backoff.saturating_mul(2).min(max_backoff);
+        }
     }
 }
 
@@ -170,6 +247,35 @@ impl StreamBackend for RedisBackend {
         let n: u64 = self.conn.lock().await.xlen(stream_key).await?;
         Ok(n)
     }
+
+    async fn oldest_event_timestamp(
+        &self,
+        stream_key: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, BackendError> {
+        // XRANGE <key> - + COUNT 1 → the one oldest entry.
+        // Response shape: Vec<StreamId> with one element containing an
+        // `id` string "<ms>-<seq>".
+        let reply: redis::streams::StreamRangeReply = self
+            .conn
+            .lock()
+            .await
+            .xrange_count(stream_key, "-", "+", 1)
+            .await?;
+        Ok(reply
+            .ids
+            .first()
+            .and_then(|entry| parse_stream_id_ms(&entry.id)))
+    }
+}
+
+/// Parse the `<ms>-<seq>` ID form Redis streams use into a UTC
+/// timestamp. Returns `None` on malformed input — `oldest_event_age`
+/// is diagnostic, not load-bearing, so we degrade silently rather
+/// than erroring.
+fn parse_stream_id_ms(id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let (ms_part, _seq_part) = id.split_once('-')?;
+    let ms: i64 = ms_part.parse().ok()?;
+    chrono::DateTime::from_timestamp_millis(ms)
 }
 
 // ─── In-memory fake ────────────────────────────────────────────────────
@@ -185,9 +291,16 @@ pub enum FailMode {
     FailNext(usize),
 }
 
-/// One stream entry: id + ordered list of (field, value) pairs. Real
-/// Redis preserves field insertion order; we match that by using a Vec.
-type StreamEntry = (String, Vec<(String, Vec<u8>)>);
+/// One stream entry: id, insertion timestamp, and ordered list of
+/// (field, value) pairs. Real Redis preserves field insertion order
+/// (Vec matches that) and embeds the ms timestamp in the id; we
+/// carry it as a separate field so tests that pre-seed or reach into
+/// the fake don't have to parse "<ms>-<seq>".
+type StreamEntry = (
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Vec<(String, Vec<u8>)>,
+);
 
 #[derive(Debug, Default)]
 struct InMemoryState {
@@ -199,8 +312,6 @@ struct InMemoryState {
     next_id: u64,
     /// Controllable failure injection.
     fail_mode: FailMode,
-    /// How many XADDs we've successfully handled (observed by tests).
-    xadd_count: u64,
 }
 
 /// Faithful-enough Redis stand-in. See the module docs for fidelity
@@ -226,10 +337,6 @@ impl InMemoryBackend {
 
     pub async fn set_fail_mode(&self, mode: FailMode) {
         self.inner.lock().await.fail_mode = mode;
-    }
-
-    pub async fn xadd_count(&self) -> u64 {
-        self.inner.lock().await.xadd_count
     }
 
     /// Read all entries from a stream in insertion order — used to
@@ -291,8 +398,9 @@ impl StreamBackend for InMemoryBackend {
             ("seq".to_string(), seq.to_string().into_bytes()),
         ];
 
+        let inserted_at = chrono::Utc::now();
         let entries = state.streams.entry(stream_key.to_string()).or_default();
-        entries.push_back((id.clone(), fields));
+        entries.push_back((id.clone(), inserted_at, fields));
 
         // MAXLEN ~ trim. Real Redis may leave the stream slightly over
         // because it trims only whole radix-tree nodes; we do strict
@@ -302,14 +410,15 @@ impl StreamBackend for InMemoryBackend {
             entries.pop_front();
         }
 
-        state.xadd_count += 1;
         Ok(id)
     }
 
     async fn set_cursor(&self, key: &str, seq: u64) -> Result<(), BackendError> {
         let mut state = self.inner.lock().await;
         Self::maybe_inject_failure(&mut state, "set_cursor")?;
-        state.kv.insert(key.to_string(), seq.to_string().into_bytes());
+        state
+            .kv
+            .insert(key.to_string(), seq.to_string().into_bytes());
         Ok(())
     }
 
@@ -337,6 +446,19 @@ impl StreamBackend for InMemoryBackend {
             .get(stream_key)
             .map(|v| v.len() as u64)
             .unwrap_or(0))
+    }
+
+    async fn oldest_event_timestamp(
+        &self,
+        stream_key: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, BackendError> {
+        // Same reasoning as `xlen` — observation path, not subject
+        // to fail injection.
+        let state = self.inner.lock().await;
+        Ok(state
+            .streams
+            .get(stream_key)
+            .and_then(|v| v.front().map(|(_, ts, _)| *ts)))
     }
 }
 

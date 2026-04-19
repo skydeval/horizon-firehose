@@ -35,6 +35,28 @@ pub enum Error {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A pipeline task panicked or returned an unrecoverable error.
+    /// Carries the short task name ("decoder", "publisher", …) so the
+    /// operator log line points at the culprit.
+    #[error("pipeline task '{task}' exited with error: {message}")]
+    TaskFailure { task: &'static str, message: String },
+
+    /// Graceful shutdown overran the DESIGN.md §3 30-second budget.
+    /// We log the outstanding work and exit non-zero so the
+    /// orchestrator restarts us with a fresh state.
+    #[error("graceful shutdown exceeded 30s budget; forcing non-zero exit")]
+    ShutdownBudgetExceeded,
+
+    /// `relay.tls_extra_ca_file` points at a path that doesn't exist
+    /// or isn't readable. We fail fast on startup rather than letting
+    /// the first TLS handshake error surface mid-run.
+    #[error("relay.tls_extra_ca_file {path:?} could not be read: {source}")]
+    TlsExtraCaFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

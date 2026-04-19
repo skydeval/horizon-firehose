@@ -90,8 +90,7 @@ struct Manifest {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let args = Args::parse();
@@ -234,7 +233,11 @@ async fn capture_loop(
                 warn!("server closed connection; will rely on inner auto-reconnect");
                 continue;
             }
-            Err(e) => return Err(format!("recv error after {} frames: {e}", manifest.frame_count).into()),
+            Err(e) => {
+                return Err(
+                    format!("recv error after {} frames: {e}", manifest.frame_count).into(),
+                );
+            }
         };
 
         let now = SystemTime::now();

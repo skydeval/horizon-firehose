@@ -39,6 +39,7 @@
 //!   loop. The main-task coordinator propagates it and exits non-zero.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -50,6 +51,7 @@ use crate::backend::{BackendError, StreamBackend};
 use crate::config::OversizePolicy;
 use crate::cursor::Cursors;
 use crate::event::Event;
+use crate::metrics::Metrics;
 
 #[derive(Debug, Clone)]
 pub struct PublisherOptions {
@@ -85,7 +87,9 @@ impl PublisherOptions {
 
 #[derive(Debug, Error)]
 pub enum PublisherError {
-    #[error("oversize event with seq={seq}, size={size} bytes exceeded max {max} — policy fail_hard")]
+    #[error(
+        "oversize event with seq={seq}, size={size} bytes exceeded max {max} — policy fail_hard"
+    )]
     OversizeFailHard { seq: u64, size: u64, max: u64 },
 
     #[error("event serialization failed for seq={seq}: {source}")]
@@ -107,7 +111,7 @@ pub struct PublisherStats {
 
 /// Handle to the spawned publisher task.
 pub struct PublisherHandle {
-    task: JoinHandle<Result<PublisherStats, PublisherError>>,
+    pub(crate) task: JoinHandle<Result<PublisherStats, PublisherError>>,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -152,9 +156,10 @@ pub fn spawn<B: StreamBackend>(
     cursors: Cursors,
     opts: PublisherOptions,
     input: mpsc::Receiver<(Event, u64)>,
+    metrics: Arc<Metrics>,
 ) -> PublisherHandle {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let task = tokio::spawn(run(backend, cursors, opts, input, shutdown_rx));
+    let task = tokio::spawn(run(backend, cursors, opts, input, shutdown_rx, metrics));
     PublisherHandle { task, shutdown_tx }
 }
 
@@ -164,6 +169,7 @@ pub async fn run<B: StreamBackend>(
     opts: PublisherOptions,
     mut input: mpsc::Receiver<(Event, u64)>,
     mut shutdown_rx: watch::Receiver<bool>,
+    metrics: Arc<Metrics>,
 ) -> Result<PublisherStats, PublisherError> {
     let mut stats = PublisherStats::default();
 
@@ -212,6 +218,9 @@ pub async fn run<B: StreamBackend>(
             match opts.on_oversize {
                 OversizePolicy::SkipWithLog => {
                     stats.events_oversize_skipped += 1;
+                    metrics
+                        .oversize_events_total
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         target: "horizon_firehose::metrics",
                         event_type = "oversize_event_skipped",
@@ -234,6 +243,9 @@ pub async fn run<B: StreamBackend>(
                     continue;
                 }
                 OversizePolicy::FailHard => {
+                    metrics
+                        .oversize_events_total
+                        .fetch_add(1, Ordering::Relaxed);
                     error!(
                         repo = debug_repo(&event),
                         seq,
@@ -261,6 +273,7 @@ pub async fn run<B: StreamBackend>(
             &data,
             seq,
             &mut shutdown_rx,
+            &metrics,
         )
         .await;
 
@@ -268,6 +281,8 @@ pub async fn run<B: StreamBackend>(
             XaddOutcome::Ok => {
                 cursors.advance(&relay, seq).await;
                 stats.events_published += 1;
+                metrics.events_total.fetch_add(1, Ordering::Relaxed);
+                metrics.bytes_total.fetch_add(size, Ordering::Relaxed);
             }
             XaddOutcome::ShuttingDown => {
                 debug!(?stats, "publisher: shutdown during retry");
@@ -284,6 +299,7 @@ enum XaddOutcome {
     ShuttingDown,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn xadd_with_retry<B: StreamBackend>(
     backend: &B,
     opts: &PublisherOptions,
@@ -292,6 +308,7 @@ async fn xadd_with_retry<B: StreamBackend>(
     data: &[u8],
     seq: u64,
     shutdown_rx: &mut watch::Receiver<bool>,
+    metrics: &Metrics,
 ) -> XaddOutcome {
     let mut backoff = opts.retry_initial;
     let mut outage_start: Option<Instant> = None;
@@ -305,10 +322,13 @@ async fn xadd_with_retry<B: StreamBackend>(
             Ok(_id) => return XaddOutcome::Ok,
             Err(err) => {
                 stats.redis_errors += 1;
+                metrics.redis_errors_total.fetch_add(1, Ordering::Relaxed);
                 let now = Instant::now();
                 outage_start.get_or_insert(now);
 
-                let downtime = outage_start.map(|s| now.duration_since(s)).unwrap_or_default();
+                let downtime = outage_start
+                    .map(|s| now.duration_since(s))
+                    .unwrap_or_default();
                 let should_warn = match last_warn {
                     None => true,
                     Some(t) => now.duration_since(t) >= opts.retry_warn_interval,
@@ -398,6 +418,10 @@ mod tests {
         }
     }
 
+    fn m() -> Arc<Metrics> {
+        Arc::new(Metrics::default())
+    }
+
     #[tokio::test]
     async fn publishes_event_and_advances_cursor_on_success() {
         let b = Arc::new(InMemoryBackend::new());
@@ -408,6 +432,7 @@ mod tests {
             c.clone(),
             opts(1000, 1 << 20, OversizePolicy::SkipWithLog),
             rx,
+            m(),
         );
 
         tx.send((tiny_commit(1), 100)).await.unwrap();
@@ -434,6 +459,7 @@ mod tests {
             c.clone(),
             opts(3, 1 << 20, OversizePolicy::SkipWithLog),
             rx,
+            m(),
         );
 
         for i in 0..20u64 {
@@ -459,6 +485,7 @@ mod tests {
             c.clone(),
             opts(1000, 10, OversizePolicy::SkipWithLog),
             rx,
+            m(),
         );
 
         tx.send((tiny_commit(1), 50)).await.unwrap();
@@ -484,6 +511,7 @@ mod tests {
             c.clone(),
             opts(1000, 10, OversizePolicy::FailHard),
             rx,
+            m(),
         );
         tx.send((tiny_commit(1), 50)).await.unwrap();
         // drop(tx) unnecessary — task returns Err before reading more.
@@ -513,6 +541,7 @@ mod tests {
             c.clone(),
             opts(1000, 1 << 20, OversizePolicy::SkipWithLog),
             rx,
+            m(),
         );
         tx.send((tiny_commit(1), 77)).await.unwrap();
         drop(tx);
@@ -548,6 +577,7 @@ mod tests {
                 ..opts(1000, 1 << 20, OversizePolicy::SkipWithLog)
             },
             rx,
+            m(),
         );
         tx.send((tiny_commit(1), 9999)).await.unwrap();
 
@@ -573,6 +603,7 @@ mod tests {
             c.clone(),
             opts(1000, 1 << 20, OversizePolicy::SkipWithLog),
             rx,
+            m(),
         );
 
         let id_ev = Event::Identity(IdentityEvent {
@@ -589,7 +620,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         // Verify the stream entry's `type` field is the string
         // "identity" per DESIGN.md §4.
-        let (_id, fields) = &entries[0];
+        let (_id, _ts, fields) = &entries[0];
         let type_field = fields
             .iter()
             .find(|(k, _)| k == "type")

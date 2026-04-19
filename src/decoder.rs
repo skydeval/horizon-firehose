@@ -22,16 +22,23 @@
 //! `on_stale_cursor` config.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use proto_blue_lex_cbor::{CborError, decode, decode_all};
 use proto_blue_lex_data::{Cid, LexValue};
 use proto_blue_repo::read_car;
 use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
 
+use crate::cursor::Cursors;
 use crate::event::{
-    AccountEvent, CommitEvent, Event, HandleEvent, IdentityEvent, Operation,
-    TombstoneEvent,
+    AccountEvent, CommitEvent, Event, HandleEvent, IdentityEvent, Operation, TombstoneEvent,
 };
+use crate::metrics::Metrics;
+use crate::ws_reader::WsReader;
 
 /// Top-level result of decoding one binary frame.
 #[derive(Debug)]
@@ -43,7 +50,10 @@ pub enum DecodedFrame {
     /// branches on `cursor.on_stale_cursor` config.
     OutdatedCursor { message: Option<String> },
     /// Any other protocol-level info or error frame.
-    Info { name: String, message: Option<String> },
+    Info {
+        name: String,
+        message: Option<String>,
+    },
     /// A known frame type we deliberately do not republish (e.g.
     /// `#sync`, which carries a repo's head CID without operations
     /// and has nothing for the downstream Postgres indexer to write).
@@ -67,7 +77,10 @@ pub enum DecodeError {
     TruncatedFrame { got: usize },
 
     #[error("expected map for {context}, got {got}")]
-    ExpectedMap { context: &'static str, got: &'static str },
+    ExpectedMap {
+        context: &'static str,
+        got: &'static str,
+    },
 
     #[error("missing required field `{0}`")]
     MissingField(&'static str),
@@ -186,9 +199,11 @@ fn decode_commit(
         let record = if action == "delete" {
             None
         } else if let Some(cid) = cid_ref {
-            let bytes = block_map.get(cid).ok_or_else(|| DecodeError::MissingCarBlock {
-                cid: cid.to_string(),
-            })?;
+            let bytes = block_map
+                .get(cid)
+                .ok_or_else(|| DecodeError::MissingCarBlock {
+                    cid: cid.to_string(),
+                })?;
             let lex = decode(bytes).map_err(|e| DecodeError::RecordDecode {
                 path: path.clone(),
                 source: Box::new(DecodeError::Cbor(e)),
@@ -456,6 +471,135 @@ fn lex_kind(v: &LexValue) -> &'static str {
     }
 }
 
+// ─── Phase 5 pipeline task ─────────────────────────────────────────
+
+/// Counters collected by the decoder task, emitted when the task exits.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DecoderStats {
+    pub frames_in: u64,
+    pub events_out: u64,
+    pub decode_errors: u64,
+    pub skipped_frames: u64,
+    pub info_frames: u64,
+    pub outdated_cursors: u64,
+}
+
+/// Handle to a spawned decoder task.
+pub struct DecoderHandle {
+    pub(crate) task: JoinHandle<DecoderStats>,
+}
+
+impl DecoderHandle {
+    /// Await the task and return its cumulative stats. The task exits
+    /// when the upstream [`WsReader`] has been shut down (its frames
+    /// channel closes), at which point the decoder has already
+    /// forwarded everything it decoded.
+    pub async fn join(self) -> DecoderStats {
+        self.task.await.unwrap_or_default()
+    }
+}
+
+/// Spawn the decoder task. It pulls `(bytes, relay)` pairs from the
+/// `WsReader`, runs [`decode_frame`], and forwards republishable
+/// events downstream as `(Event, seq)`. Decode errors are counted and
+/// logged at WARN; `#sync` and other `Skipped` frames still advance
+/// the per-relay cursor even though nothing goes downstream — so
+/// long idle gaps on `#sync`-heavy relays don't stall restart
+/// replay. `OutdatedCursor` and other `#info` frames are currently
+/// logged and counted; acting on them (per-config) lands in a later
+/// phase.
+pub fn spawn(
+    mut reader: WsReader,
+    cursors: Cursors,
+    event_tx: mpsc::Sender<(Event, u64)>,
+    metrics: Arc<Metrics>,
+) -> DecoderHandle {
+    let task = tokio::spawn(async move {
+        let mut stats = DecoderStats::default();
+
+        while let Some((bytes, relay)) = reader.recv().await {
+            stats.frames_in += 1;
+
+            match decode_frame(&bytes, &relay) {
+                Ok(DecodedFrame::Event { event, seq }) => {
+                    if event_tx.send((event, seq)).await.is_err() {
+                        debug!("decoder: downstream channel closed");
+                        break;
+                    }
+                    stats.events_out += 1;
+                }
+                Ok(DecodedFrame::Skipped { kind, seq }) => {
+                    stats.skipped_frames += 1;
+                    metrics.skipped_frames_total.fetch_add(1, Ordering::Relaxed);
+                    // Advance the cursor past the skipped frame so
+                    // replay after restart doesn't re-see it forever.
+                    // The §3 "republish to Redis" invariant is about
+                    // event-bearing frames; skipped frames by design
+                    // have no downstream entry.
+                    cursors.advance(&relay, seq).await;
+                    debug!(kind, seq, relay = %relay, "skipped frame; cursor advanced");
+                }
+                Ok(DecodedFrame::OutdatedCursor { message }) => {
+                    stats.outdated_cursors += 1;
+                    warn!(
+                        relay = %relay,
+                        message = ?message,
+                        "received OutdatedCursor from relay (policy handling is phase-next)",
+                    );
+                }
+                Ok(DecodedFrame::Info { name, message }) => {
+                    stats.info_frames += 1;
+                    info!(
+                        relay = %relay,
+                        info_name = %name,
+                        message = ?message,
+                        "relay info frame"
+                    );
+                }
+                Err(e) => {
+                    stats.decode_errors += 1;
+                    metrics.decode_errors_total.fetch_add(1, Ordering::Relaxed);
+                    // `UnknownFrameType` is a distinct bucket (DESIGN.md
+                    // §3 "Frame types: handled vs known-skip vs
+                    // unknown") — count separately so operators can
+                    // alert on "ATProto added a frame type" without
+                    // alert fatigue from every corrupted CBOR frame.
+                    if matches!(e, DecodeError::UnknownFrameType(_)) {
+                        metrics
+                            .unknown_frame_types_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Log with a short hex prefix of the frame so an
+                    // operator can correlate with a capture — without
+                    // flooding the log with full frame bodies.
+                    let hex_prefix = hex_prefix(&bytes, 32);
+                    warn!(
+                        relay = %relay,
+                        error = %e,
+                        frame_hex_prefix = %hex_prefix,
+                        "CBOR/CAR decode failed; dropping frame"
+                    );
+                }
+            }
+        }
+
+        debug!(?stats, "decoder task exiting");
+        stats
+    });
+
+    DecoderHandle { task }
+}
+
+fn hex_prefix(b: &[u8], n: usize) -> String {
+    let take = b.len().min(n);
+    let mut s = String::with_capacity(take * 2);
+    use std::fmt::Write;
+    for byte in &b[..take] {
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,9 +712,7 @@ mod tests {
                         if let Event::Commit(c) = ev {
                             for op in &c.ops {
                                 if let Some(rec) = &op.record {
-                                    if let Some(t) =
-                                        rec.get("$type").and_then(|v| v.as_str())
-                                    {
+                                    if let Some(t) = rec.get("$type").and_then(|v| v.as_str()) {
                                         *record_types.entry(t.into()).or_insert(0) += 1;
                                     }
                                 }
@@ -636,11 +778,26 @@ mod tests {
 
     fn frame_kind_label(f: &DecodedFrame) -> &'static str {
         match f {
-            DecodedFrame::Event { event: Event::Commit(_), .. } => "commit",
-            DecodedFrame::Event { event: Event::Identity(_), .. } => "identity",
-            DecodedFrame::Event { event: Event::Account(_), .. } => "account",
-            DecodedFrame::Event { event: Event::Handle(_), .. } => "handle",
-            DecodedFrame::Event { event: Event::Tombstone(_), .. } => "tombstone",
+            DecodedFrame::Event {
+                event: Event::Commit(_),
+                ..
+            } => "commit",
+            DecodedFrame::Event {
+                event: Event::Identity(_),
+                ..
+            } => "identity",
+            DecodedFrame::Event {
+                event: Event::Account(_),
+                ..
+            } => "account",
+            DecodedFrame::Event {
+                event: Event::Handle(_),
+                ..
+            } => "handle",
+            DecodedFrame::Event {
+                event: Event::Tombstone(_),
+                ..
+            } => "tombstone",
             DecodedFrame::OutdatedCursor { .. } => "outdated_cursor",
             DecodedFrame::Info { .. } => "info",
             DecodedFrame::Skipped { .. } => "skipped",

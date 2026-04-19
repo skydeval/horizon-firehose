@@ -209,6 +209,8 @@ On SIGTERM or SIGINT:
 5. Cursor persister task: write the final cursor (which now reflects all XADDed events) to Redis
 6. All tasks exit, main joins them, emit `shutdown_metrics` event, process exits zero
 
+**Signal fan-out.** Only `ws_reader` observes the global shutdown signal directly. The downstream tasks (decoder, router, publisher, cursor persister) don't need to — they exit via their input channel closing, which only happens when the previous stage has finished draining. This gives §3's drain-first ordering "for free" without per-task shutdown logic, and keeps the coordinator's job narrow: flip one watch, then await each stage in order. The §3 "drain-first (biased select!)" subsection above explains why each stage's `tokio::select!` must prioritise input over shutdown for this to work.
+
 Total shutdown budget: 30 seconds. If exceeded, log at ERROR and force-exit non-zero — the cursor won't be perfectly accurate but we won't hang the orchestrator.
 
 ### reconnect duplication
@@ -330,16 +332,26 @@ Config allowlist for `startup_metrics`: only fields in this list are emitted. Ne
   "reconnects_last_hour": 1,
   "unknown_type_count_in_window": 0,
   "oversize_events_in_window": 0,
+  "skipped_frames_in_window": 0,
+  "unknown_frame_types_in_window": 0,
   "active_relay": "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos",
   "channel_depths": {
     "ws_to_decoder": 0,
-    "decoder_to_publisher": 3
+    "decoder_to_router": 0,
+    "router_to_publisher": 3
   },
-  "cursor_age_seconds": 0.2,
+  "cursor_ages_seconds": {
+    "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos": 0,
+    "wss://relay.fyi/xrpc/com.atproto.sync.subscribeRepos": 42
+  },
   "oldest_event_age_seconds": 42,
   "uptime_seconds": 3600
 }
 ```
+
+**`cursor_ages_seconds` is a per-relay object, not a scalar.** Each configured relay has an independent, relay-scoped sequence number; a multi-relay deployment with one healthy primary and a backlogged fallback would hide the fallback's staleness if we flattened to a single value. The field is keyed by the full relay URL (same key used for the cursor's Redis entry, pre-base64url). Operators with a single relay see a one-entry object. Values are whole seconds since the publisher last advanced that relay's cursor. Field name is *plural* (`cursor_ages_seconds`) to make the "multiple" shape obvious to anyone grepping for it.
+
+**`channel_depths` reflects the three-stage pipeline** introduced by Phase 4's router: `ws_to_decoder`, `decoder_to_router`, `router_to_publisher`. An absent key (`null` in JSON) means that channel's producer has already dropped its sender — the channel is draining, not buffering.
 
 **shutdown_metrics** (emitted once on graceful shutdown):
 ```json

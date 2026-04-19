@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -25,12 +25,23 @@ use tracing::{debug, info, warn};
 
 use crate::backend::{BackendError, StreamBackend};
 
+/// Per-relay cursor state. `seq` is the last successfully XADDed
+/// firehose sequence number; `last_advanced_at` lets the metrics
+/// emitter report how stale each relay's cursor is (a creeping
+/// `cursor_age_seconds` is the canonical "we're not catching up"
+/// indicator).
+#[derive(Clone, Copy, Debug)]
+struct CursorState {
+    seq: u64,
+    last_advanced_at: Instant,
+}
+
 /// Thread-safe per-relay cursor tracker. Cheaply cloneable — the
 /// internal storage is an `Arc<RwLock>`, so every clone sees the same
 /// state.
 #[derive(Clone, Default, Debug)]
 pub struct Cursors {
-    inner: Arc<RwLock<HashMap<String, u64>>>,
+    inner: Arc<RwLock<HashMap<String, CursorState>>>,
 }
 
 impl Cursors {
@@ -45,17 +56,22 @@ impl Cursors {
     /// Returns the new value (same as old if the advance was rejected).
     pub async fn advance(&self, relay: &str, seq: u64) -> u64 {
         let mut map = self.inner.write().await;
-        let entry = map.entry(relay.to_string()).or_insert(0);
-        if seq > *entry {
-            *entry = seq;
+        let now = Instant::now();
+        let entry = map.entry(relay.to_string()).or_insert(CursorState {
+            seq: 0,
+            last_advanced_at: now,
+        });
+        if seq > entry.seq {
+            entry.seq = seq;
+            entry.last_advanced_at = now;
         }
-        *entry
+        entry.seq
     }
 
     /// Read the current cursor for `relay`. `None` if we've never seen
     /// (or loaded) a value for it.
     pub async fn get(&self, relay: &str) -> Option<u64> {
-        self.inner.read().await.get(relay).copied()
+        self.inner.read().await.get(relay).map(|c| c.seq)
     }
 
     /// Snapshot all known cursors as `(relay_url, seq)` pairs. Order is
@@ -65,7 +81,22 @@ impl Cursors {
             .read()
             .await
             .iter()
-            .map(|(k, v)| (k.clone(), *v))
+            .map(|(k, v)| (k.clone(), v.seq))
+            .collect()
+    }
+
+    /// Per-relay cursor staleness in seconds, measured from `now`.
+    /// Used by the periodic metrics emitter — a growing age is the
+    /// canonical "we're falling behind" indicator.
+    pub async fn age_seconds(&self, now: Instant) -> HashMap<String, u64> {
+        self.inner
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| {
+                let age = now.saturating_duration_since(v.last_advanced_at);
+                (k.clone(), age.as_secs())
+            })
             .collect()
     }
 
@@ -83,7 +114,19 @@ impl Cursors {
             match backend.get_cursor(&key).await? {
                 Some(seq) => {
                     info!(relay = %relay, seq, key = %key, "loaded cursor on startup");
-                    self.inner.write().await.insert(relay.clone(), seq);
+                    // `last_advanced_at = now` is a small lie — the
+                    // cursor was really advanced whenever the previous
+                    // process wrote it — but this keeps the age gauge
+                    // clean at startup. Real stale-cursor detection
+                    // lives in the firehose protocol error frames,
+                    // not here.
+                    self.inner.write().await.insert(
+                        relay.clone(),
+                        CursorState {
+                            seq,
+                            last_advanced_at: Instant::now(),
+                        },
+                    );
                 }
                 None => {
                     debug!(relay = %relay, key = %key, "no prior cursor; will resume from live tip");
@@ -141,7 +184,7 @@ pub fn cursor_key(relay_url: &str) -> String {
 
 /// Handle to a spawned persister task.
 pub struct PersisterHandle {
-    task: JoinHandle<PersisterStats>,
+    pub(crate) task: JoinHandle<PersisterStats>,
     shutdown_tx: watch::Sender<bool>,
 }
 
