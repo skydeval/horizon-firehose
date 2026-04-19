@@ -7,6 +7,15 @@
 // their test users without masking genuinely dead items in CI
 // (where tests run).
 #![cfg_attr(not(test), allow(dead_code))]
+// `result_large_err` fires on every function that returns
+// `Result<_, Error>` because `error::Error::ConfigLoad` wraps
+// `figment::Error`, which is itself >200 bytes. Boxing figment
+// errors is a large invasive refactor for a lint that targets
+// hot-path performance — `Error` is only in the cold startup +
+// shutdown paths where a 200-byte return size is irrelevant.
+// The lint would be useful on per-event hot code; for this crate
+// it's pure noise.
+#![allow(clippy::result_large_err)]
 
 //! Phase 5 scope (per DESIGN.md §6): wire every module into a running
 //! pipeline, coordinate DESIGN.md §3 shutdown ordering, detect task
@@ -38,14 +47,16 @@ mod cursor;
 mod decoder;
 mod error;
 mod event;
+#[cfg(test)]
+mod golden_test;
 mod metrics;
+#[cfg(test)]
+mod pipeline_main_test;
+#[cfg(test)]
+mod pipeline_test;
 mod publisher;
 mod router;
 mod ws_reader;
-#[cfg(test)]
-mod pipeline_test;
-#[cfg(test)]
-mod pipeline_main_test;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -99,8 +110,7 @@ fn run() -> Result<(), Error> {
 }
 
 fn init_tracing(cfg: &Config) {
-    let filter = EnvFilter::try_new(&cfg.logging.level)
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_new(&cfg.logging.level).unwrap_or_else(|_| EnvFilter::new("info"));
 
     match cfg.logging.format {
         LogFormat::Json => {
@@ -248,8 +258,7 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
     let ws_to_decoder_weak = ws_reader.frames_weak();
     let ws_state = ws_reader.state_reader();
 
-    let mut decoder_handle =
-        decoder::spawn(ws_reader, cursors.clone(), event_tx, metrics.clone());
+    let mut decoder_handle = decoder::spawn(ws_reader, cursors.clone(), event_tx, metrics.clone());
 
     let mut router_handle = router::spawn(
         router::RouterOptions {
@@ -342,7 +351,10 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
             if *panicked {
                 error!(task = name, "pipeline task panicked — initiating shutdown");
             } else {
-                error!(task = name, "pipeline task exited unexpectedly — initiating shutdown");
+                error!(
+                    task = name,
+                    "pipeline task exited unexpectedly — initiating shutdown"
+                );
             }
             Some(*name)
         }
@@ -493,10 +505,7 @@ async fn shutdown_cascade<B: StreamBackend>(
 #[derive(Debug)]
 enum ExitReason {
     Signal,
-    TaskEnded {
-        name: &'static str,
-        panicked: bool,
-    },
+    TaskEnded { name: &'static str, panicked: bool },
 }
 
 /// Listen for SIGINT/SIGTERM and flip the shared shutdown watch.

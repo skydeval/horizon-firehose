@@ -261,7 +261,10 @@ impl StreamBackend for RedisBackend {
             .await
             .xrange_count(stream_key, "-", "+", 1)
             .await?;
-        Ok(reply.ids.first().and_then(|entry| parse_stream_id_ms(&entry.id)))
+        Ok(reply
+            .ids
+            .first()
+            .and_then(|entry| parse_stream_id_ms(&entry.id)))
     }
 }
 
@@ -293,7 +296,11 @@ pub enum FailMode {
 /// (Vec matches that) and embeds the ms timestamp in the id; we
 /// carry it as a separate field so tests that pre-seed or reach into
 /// the fake don't have to parse "<ms>-<seq>".
-type StreamEntry = (String, chrono::DateTime<chrono::Utc>, Vec<(String, Vec<u8>)>);
+type StreamEntry = (
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Vec<(String, Vec<u8>)>,
+);
 
 #[derive(Debug, Default)]
 struct InMemoryState {
@@ -409,7 +416,9 @@ impl StreamBackend for InMemoryBackend {
     async fn set_cursor(&self, key: &str, seq: u64) -> Result<(), BackendError> {
         let mut state = self.inner.lock().await;
         Self::maybe_inject_failure(&mut state, "set_cursor")?;
-        state.kv.insert(key.to_string(), seq.to_string().into_bytes());
+        state
+            .kv
+            .insert(key.to_string(), seq.to_string().into_bytes());
         Ok(())
     }
 

@@ -348,11 +348,17 @@ mod tests {
         // Send 3 events: one passes, one drops (wrong type), one is
         // identity (always passes).
         in_tx
-            .send((commit(vec![op_with_type("app.bsky.feed.post", "create")]), 1))
+            .send((
+                commit(vec![op_with_type("app.bsky.feed.post", "create")]),
+                1,
+            ))
             .await
             .unwrap();
         in_tx
-            .send((commit(vec![op_with_type("app.bsky.feed.like", "create")]), 2))
+            .send((
+                commit(vec![op_with_type("app.bsky.feed.like", "create")]),
+                2,
+            ))
             .await
             .unwrap();
         in_tx

@@ -93,7 +93,9 @@ async fn pipeline_publishes_every_fixture_event_and_advances_cursor() {
 
     // Empty filter → pass everything.
     let router_handle = router::spawn(
-        RouterOptions { record_types: vec![] },
+        RouterOptions {
+            record_types: vec![],
+        },
         router_in_rx,
         pub_in_tx,
     );
@@ -219,7 +221,9 @@ async fn pipeline_maxlen_trims_but_cursor_reflects_all_publishes() {
     let (pub_in_tx, pub_in_rx) = mpsc::channel::<(Event, u64)>(1024);
 
     let router_handle = router::spawn(
-        RouterOptions { record_types: vec![] },
+        RouterOptions {
+            record_types: vec![],
+        },
         router_in_rx,
         pub_in_tx,
     );
@@ -271,7 +275,8 @@ async fn cursor_persister_writes_under_base64url_key() {
 
     // Round-trip via load_initial: a fresh Cursors should hydrate.
     let fresh = Cursors::new();
-    fresh.load_initial(backend.as_ref(), &[RELAY.to_string()])
+    fresh
+        .load_initial(backend.as_ref(), &[RELAY.to_string()])
         .await
         .unwrap();
     assert_eq!(fresh.get(RELAY).await, Some(4242));
@@ -293,13 +298,17 @@ async fn pipeline_recovers_from_transient_redis_outage_without_losing_events() {
     // Inject several failures covering the first few XADDs. Retry
     // should ride through them without losing events or advancing the
     // cursor past a non-XADDed one.
-    backend.set_fail_mode(crate::backend::FailMode::FailNext(4)).await;
+    backend
+        .set_fail_mode(crate::backend::FailMode::FailNext(4))
+        .await;
 
     let (router_in_tx, router_in_rx) = mpsc::channel::<(Event, u64)>(1024);
     let (pub_in_tx, pub_in_rx) = mpsc::channel::<(Event, u64)>(1024);
 
     let router_handle = router::spawn(
-        RouterOptions { record_types: vec![] },
+        RouterOptions {
+            record_types: vec![],
+        },
         router_in_rx,
         pub_in_tx,
     );
@@ -328,7 +337,11 @@ async fn pipeline_recovers_from_transient_redis_outage_without_losing_events() {
     let _ = router_handle.shutdown().await;
     let stats = publisher_handle.join().await.unwrap();
 
-    assert!(stats.redis_errors >= 4, "expected ≥4 errors, got {}", stats.redis_errors);
+    assert!(
+        stats.redis_errors >= 4,
+        "expected ≥4 errors, got {}",
+        stats.redis_errors
+    );
     assert_eq!(stats.events_published as usize, decoded.len());
     assert_eq!(cursors.get(RELAY).await, Some(max_seq));
     assert_eq!(

@@ -39,8 +39,7 @@ use crate::ws_reader::{self, WsReaderOptions};
 /// 3 proved every captured frame decodes; Phase 5 just needs one that
 /// will produce an event.
 fn sample_fixture_frame() -> Option<Vec<u8>> {
-    let fixtures_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let manifest_path = fixtures_dir.join("manifest.json");
     let manifest_str = std::fs::read_to_string(&manifest_path).ok()?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest_str).ok()?;
@@ -140,7 +139,9 @@ async fn end_to_end_pipeline_delivers_event_to_backend() {
     );
     let decoder_h = decoder::spawn(ws_reader, cursors.clone(), event_tx, Metrics::new());
     let router_h = router::spawn(
-        RouterOptions { record_types: vec![] },
+        RouterOptions {
+            record_types: vec![],
+        },
         event_rx,
         filtered_tx,
     );
@@ -206,7 +207,9 @@ async fn shutdown_cascade_finalises_cursor_within_budget() {
     );
     let decoder_h = decoder::spawn(ws_reader, cursors.clone(), event_tx, Metrics::new());
     let router_h = router::spawn(
-        RouterOptions { record_types: vec![] },
+        RouterOptions {
+            record_types: vec![],
+        },
         event_rx,
         filtered_tx,
     );
@@ -218,8 +221,7 @@ async fn shutdown_cascade_finalises_cursor_within_budget() {
         Metrics::new(),
     );
     // Persist cursors every 20ms so we know the periodic path runs.
-    let persister_h =
-        spawn_persister(cursors.clone(), backend.clone(), Duration::from_millis(20));
+    let persister_h = spawn_persister(cursors.clone(), backend.clone(), Duration::from_millis(20));
 
     // Let one event flow through.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -320,7 +322,9 @@ async fn pipeline_initializes_even_when_backend_is_failing_then_shuts_down() {
     // directly. What we're testing is the publisher-with-broken-backend
     // path remaining shutdown-responsive.
     let router_h = router::spawn(
-        RouterOptions { record_types: vec![] },
+        RouterOptions {
+            record_types: vec![],
+        },
         event_rx,
         filtered_tx,
     );
@@ -331,8 +335,7 @@ async fn pipeline_initializes_even_when_backend_is_failing_then_shuts_down() {
         filtered_rx,
         Metrics::new(),
     );
-    let persister_h =
-        spawn_persister(cursors.clone(), backend.clone(), Duration::from_millis(20));
+    let persister_h = spawn_persister(cursors.clone(), backend.clone(), Duration::from_millis(20));
 
     // Inject one event so the publisher is actively retrying.
     let ev = Event::Tombstone(crate::event::TombstoneEvent {
@@ -714,9 +717,8 @@ async fn periodic_metrics_delta_captures_increments_between_ticks() {
 #[tokio::test]
 async fn startup_metrics_only_emits_allowlisted_fields_no_credentials() {
     use crate::config::{
-        Config, CursorConfig, FilterConfig, LoggingConfig, OversizePolicy,
-        ProtocolErrorPolicy, PublisherConfig, RedisConfig, RelayConfig,
-        StaleCursorPolicy,
+        Config, CursorConfig, FilterConfig, LoggingConfig, OversizePolicy, ProtocolErrorPolicy,
+        PublisherConfig, RedisConfig, RelayConfig, StaleCursorPolicy,
     };
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -744,7 +746,9 @@ async fn startup_metrics_only_emits_allowlisted_fields_no_credentials() {
             max_stream_len: 500_000,
             cleanup_unknown_cursors: false,
         },
-        filter: FilterConfig { record_types: vec![] },
+        filter: FilterConfig {
+            record_types: vec![],
+        },
         cursor: CursorConfig {
             save_interval_seconds: 5,
             on_stale_cursor: StaleCursorPolicy::LiveTip,
@@ -767,7 +771,11 @@ async fn startup_metrics_only_emits_allowlisted_fields_no_credentials() {
         .iter()
         .filter(|r| r.field("event_type") == Some("startup_metrics"))
         .collect();
-    assert_eq!(startup.len(), 1, "exactly one startup_metrics event expected");
+    assert_eq!(
+        startup.len(),
+        1,
+        "exactly one startup_metrics event expected"
+    );
 
     // Every emitted field value must not contain the secret. The
     // `payload` JSON field contains the structured §4 payload; it

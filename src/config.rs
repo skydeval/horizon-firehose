@@ -525,7 +525,9 @@ max_stream_len = 500000
             );
             let path = write_config(jail, &body);
             let err = Config::load(&path).unwrap_err();
-            assert!(matches!(err, Error::ConfigValidation(s) if s.contains("reconnect_max_delay_ms")));
+            assert!(
+                matches!(err, Error::ConfigValidation(s) if s.contains("reconnect_max_delay_ms"))
+            );
             Ok(())
         });
     }
@@ -533,7 +535,10 @@ max_stream_len = 500000
     #[test]
     fn rejects_zero_values_that_must_be_positive() {
         for (needle, replacement) in [
-            ("reconnect_initial_delay_ms = 1000", "reconnect_initial_delay_ms = 0"),
+            (
+                "reconnect_initial_delay_ms = 1000",
+                "reconnect_initial_delay_ms = 0",
+            ),
             ("failover_threshold = 5", "failover_threshold = 0"),
             ("max_stream_len = 500000", "max_stream_len = 0"),
             ("save_interval_seconds = 5", "save_interval_seconds = 0"),
@@ -602,7 +607,10 @@ max_stream_len = 500000
     #[test]
     fn rejects_invalid_enum_strings() {
         Jail::expect_with(|jail| {
-            let body = MINIMAL_CONFIG.replace("on_stale_cursor = \"live_tip\"", "on_stale_cursor = \"yolo\"");
+            let body = MINIMAL_CONFIG.replace(
+                "on_stale_cursor = \"live_tip\"",
+                "on_stale_cursor = \"yolo\"",
+            );
             let path = write_config(jail, &body);
             let err = Config::load(&path).unwrap_err();
             assert!(matches!(err, Error::ConfigLoad { .. }));
@@ -612,7 +620,10 @@ max_stream_len = 500000
 
     #[test]
     fn redis_url_host_strips_userinfo_and_path() {
-        assert_eq!(sanitize_redis_host("redis://localhost:6379"), "localhost:6379");
+        assert_eq!(
+            sanitize_redis_host("redis://localhost:6379"),
+            "localhost:6379"
+        );
         assert_eq!(
             sanitize_redis_host("redis://user:pass@host.example:6380/0"),
             "host.example:6380",
@@ -621,10 +632,7 @@ max_stream_len = 500000
             sanitize_redis_host("rediss://h@host.example:6380"),
             "host.example:6380",
         );
-        assert_eq!(
-            sanitize_redis_host("redis://host?timeout=1"),
-            "host",
-        );
+        assert_eq!(sanitize_redis_host("redis://host?timeout=1"), "host",);
     }
 
     #[test]

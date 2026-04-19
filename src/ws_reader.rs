@@ -200,13 +200,7 @@ impl SharedState {
         }
     }
 
-    fn record_failure(
-        &mut self,
-        idx: usize,
-        now: Instant,
-        threshold: u32,
-        cooldown: Duration,
-    ) {
+    fn record_failure(&mut self, idx: usize, now: Instant, threshold: u32, cooldown: Duration) {
         let r = &mut self.relays[idx];
         r.consecutive_failures = r.consecutive_failures.saturating_add(1);
         r.last_failed_at = Some(now);
@@ -314,7 +308,9 @@ impl WsReader {
     /// Clone the supervisor state so `main` can read reconnect stats
     /// after this `WsReader` has been moved into the decoder task.
     pub fn state_reader(&self) -> WsStateReader {
-        WsStateReader { state: self.state.clone() }
+        WsStateReader {
+            state: self.state.clone(),
+        }
     }
 
     /// WeakSender for the frames channel. Used by the metrics emitter
@@ -476,12 +472,7 @@ async fn supervisor(
             ref failure => {
                 let (consecutive, reconnect_metrics) = {
                     let mut s = state.lock().unwrap();
-                    s.record_failure(
-                        idx,
-                        Instant::now(),
-                        cfg.failover_threshold,
-                        cooldown,
-                    );
+                    s.record_failure(idx, Instant::now(), cfg.failover_threshold, cooldown);
                     let consecutive = s.relays[idx].consecutive_failures;
                     let rm = s.metrics(Instant::now());
                     (consecutive, rm)
@@ -801,7 +792,9 @@ mod tests {
                     .or_else(|| behaviors.last().cloned())
                     .unwrap_or(Behavior::CloseImmediately);
                 tokio::spawn(async move {
-                    let Ok(mut ws) = accept_async(stream).await else { return };
+                    let Ok(mut ws) = accept_async(stream).await else {
+                        return;
+                    };
                     match behavior {
                         Behavior::CloseImmediately => {
                             let _ = ws.close(None).await;
@@ -996,7 +989,10 @@ mod tests {
         assert_eq!(frame.1, primary.url);
 
         // We should have ended up back on primary.
-        assert_eq!(reader.metrics().active_relay.as_deref(), Some(primary.url.as_str()));
+        assert_eq!(
+            reader.metrics().active_relay.as_deref(),
+            Some(primary.url.as_str())
+        );
 
         reader.shutdown().await;
         primary.shutdown().await;

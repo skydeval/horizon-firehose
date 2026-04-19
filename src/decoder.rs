@@ -35,8 +35,7 @@ use tracing::{debug, info, warn};
 
 use crate::cursor::Cursors;
 use crate::event::{
-    AccountEvent, CommitEvent, Event, HandleEvent, IdentityEvent, Operation,
-    TombstoneEvent,
+    AccountEvent, CommitEvent, Event, HandleEvent, IdentityEvent, Operation, TombstoneEvent,
 };
 use crate::metrics::Metrics;
 use crate::ws_reader::WsReader;
@@ -51,7 +50,10 @@ pub enum DecodedFrame {
     /// branches on `cursor.on_stale_cursor` config.
     OutdatedCursor { message: Option<String> },
     /// Any other protocol-level info or error frame.
-    Info { name: String, message: Option<String> },
+    Info {
+        name: String,
+        message: Option<String>,
+    },
     /// A known frame type we deliberately do not republish (e.g.
     /// `#sync`, which carries a repo's head CID without operations
     /// and has nothing for the downstream Postgres indexer to write).
@@ -75,7 +77,10 @@ pub enum DecodeError {
     TruncatedFrame { got: usize },
 
     #[error("expected map for {context}, got {got}")]
-    ExpectedMap { context: &'static str, got: &'static str },
+    ExpectedMap {
+        context: &'static str,
+        got: &'static str,
+    },
 
     #[error("missing required field `{0}`")]
     MissingField(&'static str),
@@ -194,9 +199,11 @@ fn decode_commit(
         let record = if action == "delete" {
             None
         } else if let Some(cid) = cid_ref {
-            let bytes = block_map.get(cid).ok_or_else(|| DecodeError::MissingCarBlock {
-                cid: cid.to_string(),
-            })?;
+            let bytes = block_map
+                .get(cid)
+                .ok_or_else(|| DecodeError::MissingCarBlock {
+                    cid: cid.to_string(),
+                })?;
             let lex = decode(bytes).map_err(|e| DecodeError::RecordDecode {
                 path: path.clone(),
                 source: Box::new(DecodeError::Cbor(e)),
@@ -705,9 +712,7 @@ mod tests {
                         if let Event::Commit(c) = ev {
                             for op in &c.ops {
                                 if let Some(rec) = &op.record {
-                                    if let Some(t) =
-                                        rec.get("$type").and_then(|v| v.as_str())
-                                    {
+                                    if let Some(t) = rec.get("$type").and_then(|v| v.as_str()) {
                                         *record_types.entry(t.into()).or_insert(0) += 1;
                                     }
                                 }
@@ -773,11 +778,26 @@ mod tests {
 
     fn frame_kind_label(f: &DecodedFrame) -> &'static str {
         match f {
-            DecodedFrame::Event { event: Event::Commit(_), .. } => "commit",
-            DecodedFrame::Event { event: Event::Identity(_), .. } => "identity",
-            DecodedFrame::Event { event: Event::Account(_), .. } => "account",
-            DecodedFrame::Event { event: Event::Handle(_), .. } => "handle",
-            DecodedFrame::Event { event: Event::Tombstone(_), .. } => "tombstone",
+            DecodedFrame::Event {
+                event: Event::Commit(_),
+                ..
+            } => "commit",
+            DecodedFrame::Event {
+                event: Event::Identity(_),
+                ..
+            } => "identity",
+            DecodedFrame::Event {
+                event: Event::Account(_),
+                ..
+            } => "account",
+            DecodedFrame::Event {
+                event: Event::Handle(_),
+                ..
+            } => "handle",
+            DecodedFrame::Event {
+                event: Event::Tombstone(_),
+                ..
+            } => "tombstone",
             DecodedFrame::OutdatedCursor { .. } => "outdated_cursor",
             DecodedFrame::Info { .. } => "info",
             DecodedFrame::Skipped { .. } => "skipped",

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs when a branch gets a new push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # NOTE: not setting `RUSTFLAGS: -D warnings` here — that would
+  # apply to every cargo invocation, including dependency builds,
+  # and a single warning in a transitive dep would fail CI. The
+  # `-D warnings` intent is scoped to clippy (our code) via the
+  # `-- -D warnings` args on the clippy job below.
+
+jobs:
+  # ─── Fast feedback: fmt + clippy on a small runner ──────────────────
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # Use `--locked` so clippy runs against the vendored lockfile,
+        # not whatever `cargo update` might resolve on the runner.
+        # `-D warnings` is already set via RUSTFLAGS but we also pass
+        # it on the clippy CLI so lint-specific warnings (which are
+        # separate from rustc warnings) get promoted too.
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  # ─── Proto-blue SHA integrity check ────────────────────────────────
+  # DESIGN.md round-3 F26: catch silent drift from upstream
+  # force-pushes. Runs before the full build to fail fast — no point
+  # burning 5 minutes on test + audit if the dependency tree is wrong.
+  verify-proto-blue-sha:
+    name: verify proto-blue SHA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable, no components)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry (Cargo.lock is already in-tree)
+        uses: Swatinem/rust-cache@v2
+
+      # `cargo fetch --locked` populates Cargo.lock without building.
+      # Required because the expected-SHA script reads Cargo.lock, and
+      # a cold checkout may not have it if we ever stop committing
+      # Cargo.lock (we do today — this is belt-and-suspenders).
+      - name: cargo fetch --locked
+        run: cargo fetch --locked
+
+      - name: Verify proto-blue resolved SHA matches expected
+        run: bash .github/verify-proto-blue-sha.sh
+
+  # ─── Build + test ──────────────────────────────────────────────────
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --locked --all-targets
+        run: cargo build --locked --all-targets
+
+      - name: cargo test --locked --all-targets
+        run: cargo test --locked --all-targets
+
+  # ─── Dependency vulnerability scan ─────────────────────────────────
+  # Uses the official RustSec action. Separate job so advisory-DB
+  # flakes don't block other lanes; `continue-on-error` keeps a
+  # newly-published advisory from breaking main until we've
+  # triaged it.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the exact version the upstream README recommends,
+      # because rustsec/audit-check does not publish a floating `v2`
+      # tag. Bump deliberately when a new v2.x ships (check
+      # <https://github.com/rustsec/audit-check/tags>).
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

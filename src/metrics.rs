@@ -205,7 +205,8 @@ impl ChannelGauges {
 }
 
 fn depth<T>(w: &mpsc::WeakSender<T>) -> Option<u64> {
-    w.upgrade().map(|s| (s.max_capacity() - s.capacity()) as u64)
+    w.upgrade()
+        .map(|s| (s.max_capacity() - s.capacity()) as u64)
 }
 
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
@@ -371,12 +372,16 @@ mod tests {
 
     #[test]
     fn delta_computes_per_window_from_two_snapshots() {
-        let mut prev = CumulativeSnapshot::default();
-        prev.events = 100;
-        prev.bytes = 10_000;
-        let mut curr = prev;
-        curr.events = 250;
-        curr.bytes = 20_000;
+        let prev = CumulativeSnapshot {
+            events: 100,
+            bytes: 10_000,
+            ..Default::default()
+        };
+        let curr = CumulativeSnapshot {
+            events: 250,
+            bytes: 20_000,
+            ..prev
+        };
         let d = curr.delta(&prev);
         assert_eq!(d.events, 150);
         assert_eq!(d.bytes, 10_000);
@@ -425,9 +430,6 @@ mod tests {
             m.record_reconnect(base + Duration::from_millis(i as u64))
                 .await;
         }
-        assert_eq!(
-            m.reconnect_history.lock().await.len(),
-            RECONNECT_RING_CAP
-        );
+        assert_eq!(m.reconnect_history.lock().await.len(), RECONNECT_RING_CAP);
     }
 }

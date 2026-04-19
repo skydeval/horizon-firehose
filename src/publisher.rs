@@ -87,7 +87,9 @@ impl PublisherOptions {
 
 #[derive(Debug, Error)]
 pub enum PublisherError {
-    #[error("oversize event with seq={seq}, size={size} bytes exceeded max {max} — policy fail_hard")]
+    #[error(
+        "oversize event with seq={seq}, size={size} bytes exceeded max {max} — policy fail_hard"
+    )]
     OversizeFailHard { seq: u64, size: u64, max: u64 },
 
     #[error("event serialization failed for seq={seq}: {source}")]
@@ -216,7 +218,9 @@ pub async fn run<B: StreamBackend>(
             match opts.on_oversize {
                 OversizePolicy::SkipWithLog => {
                     stats.events_oversize_skipped += 1;
-                    metrics.oversize_events_total.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .oversize_events_total
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         target: "horizon_firehose::metrics",
                         event_type = "oversize_event_skipped",
@@ -239,7 +243,9 @@ pub async fn run<B: StreamBackend>(
                     continue;
                 }
                 OversizePolicy::FailHard => {
-                    metrics.oversize_events_total.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .oversize_events_total
+                        .fetch_add(1, Ordering::Relaxed);
                     error!(
                         repo = debug_repo(&event),
                         seq,
@@ -320,7 +326,9 @@ async fn xadd_with_retry<B: StreamBackend>(
                 let now = Instant::now();
                 outage_start.get_or_insert(now);
 
-                let downtime = outage_start.map(|s| now.duration_since(s)).unwrap_or_default();
+                let downtime = outage_start
+                    .map(|s| now.duration_since(s))
+                    .unwrap_or_default();
                 let should_warn = match last_warn {
                     None => true,
                     Some(t) => now.duration_since(t) >= opts.retry_warn_interval,

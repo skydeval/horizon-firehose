@@ -169,5 +169,4 @@ mod tests {
         assert!(v.as_object().unwrap().contains_key("handle"));
         assert!(v["handle"].is_null());
     }
-
 }
