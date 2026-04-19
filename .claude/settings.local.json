@@ -22,7 +22,13 @@
       "WebSearch",
       "WebFetch(domain:github.com)",
       "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo build 2>&1 | tail -5\")",
-      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test --quiet 2>&1 | tail -10\")"
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test --quiet 2>&1 | tail -10\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"find ~/.cargo/git/checkouts -type d -name 'proto-blue-ws' 2>/dev/null | head -5\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"ls /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/crates/proto-blue-ws/ && echo '---' && cat /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/crates/proto-blue-ws/Cargo.toml\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"ls /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/crates/proto-blue-ws/src/ && echo '---LIB---' && cat /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/crates/proto-blue-ws/src/lib.rs\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cat /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/crates/proto-blue-ws/src/keepalive.rs\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cat /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/crates/proto-blue-ws/src/error.rs\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test 2>&1 | tail -80\")"
     ]
   }
 }

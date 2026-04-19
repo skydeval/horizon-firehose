@@ -760,6 +760,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "figment",
+ "futures-util",
  "proptest",
  "proto-blue-api",
  "proto-blue-lex-cbor",
@@ -774,6 +775,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-test",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
 ]

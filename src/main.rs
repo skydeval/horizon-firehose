@@ -23,6 +23,11 @@
 mod config;
 #[allow(dead_code)]
 mod error;
+// Phase 2 module — declared so cargo compiles and tests it. The
+// pipeline integration (calling `ws_reader::spawn` from `run`) lands in
+// a later phase when the decoder + publisher tasks exist to wire to.
+#[allow(dead_code)]
+mod ws_reader;
 
 use std::process::ExitCode;
 
