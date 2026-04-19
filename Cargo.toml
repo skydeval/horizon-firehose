@@ -33,6 +33,13 @@ thiserror = "2"
 # Base64 encoding for cursor keys
 base64 = "0.22"
 
+# CLI argument parsing for the capture-fixtures binary.
+clap = { version = "4", features = ["derive"] }
+
+# ISO 8601 timestamps for capture manifests (and the event JSON in
+# Phase 3). Default features include `clock` for `Utc::now()`.
+chrono = "0.4"
+
 # TLS (rustls with system roots)
 rustls = "0.23"
 rustls-native-certs = "0.8"

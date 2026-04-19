@@ -1,1 +1,6 @@
 /target
+
+# Captured raw frames live here. The bulk corpus is regenerated on
+# demand via `cargo run --bin capture-fixtures`; only specific curated
+# fixtures (committed via `git add -f`) belong in source control.
+tests/fixtures/

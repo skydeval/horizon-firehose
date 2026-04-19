@@ -71,7 +71,8 @@ This project is also a portfolio artifact for the Navigators Guild apprentice pr
 ### high-level flow
 
 ```
-  wss://bsky.network  (or configurable relay URL)
+  wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos
+  (or configurable relay URL — must include the XRPC path)
           │
           │  WebSocket frames (CBOR-encoded)
           ▼
@@ -288,7 +289,7 @@ Three event types emitted via tracing:
   "type": "startup_metrics",
   "config_version": 1,
   "consumer_version": "1.0.0",
-  "relay_primary": "wss://bsky.network",
+  "relay_primary": "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos",
   "relay_fallbacks": [],
   "redis_url_host": "redis",
   "max_stream_len": 500000,
@@ -315,7 +316,7 @@ Config allowlist for `startup_metrics`: only fields in this list are emitted. Ne
   "reconnects_last_hour": 1,
   "unknown_type_count_in_window": 0,
   "oversize_events_in_window": 0,
-  "active_relay": "wss://bsky.network",
+  "active_relay": "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos",
   "channel_depths": {
     "ws_to_decoder": 0,
     "decoder_to_publisher": 3
@@ -338,7 +339,7 @@ Config allowlist for `startup_metrics`: only fields in this list are emitted. Ne
   "total_redis_errors": 0,
   "total_reconnects": 17,
   "final_cursor_per_relay": {
-    "wss://bsky.network": "987654321"
+    "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos": "987654321"
   }
 }
 ```
@@ -349,13 +350,13 @@ Config allowlist for `startup_metrics`: only fields in this list are emitted. Ne
 config_version = 1
 
 [relay]
-url = "wss://bsky.network"
+url = "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos"
 fallbacks = []
 
-# example multi-relay:
+# example multi-relay (each fallback also requires the XRPC path):
 # fallbacks = [
-#   "wss://relay.fyi",
-#   "wss://relay.blacksky.app",
+#   "wss://relay.fyi/xrpc/com.atproto.sync.subscribeRepos",
+#   "wss://relay.blacksky.app/xrpc/com.atproto.sync.subscribeRepos",
 # ]
 
 reconnect_initial_delay_ms = 1000
@@ -387,6 +388,23 @@ on_oversize = "skip_with_log"         # or "fail_hard"
 level = "info"
 format = "json"                       # or "pretty"
 ```
+
+**`[relay]` and `[redis]` are required sections — the consumer fails
+to start if either is missing.** This prevents silent misconfiguration
+where defaults could point an operator at wrong infrastructure (the
+public `bsky.network` relay or a cache at `redis://redis:6379` that
+isn't theirs). Other sections (`[filter]`, `[cursor]`, `[publisher]`,
+`[logging]`) have universal defaults and can be omitted.
+
+**Relay URLs must include the full XRPC endpoint path
+(`/xrpc/com.atproto.sync.subscribeRepos`)** because horizon-firehose
+uses a generic WebSocket client (proto-blue-ws on top of
+tokio-tungstenite) that does not auto-route to the subscription path
+the way higher-level ATProto libraries (e.g. Python `atproto`) do.
+Sequence numbers are also relay-scoped, so the path is part of each
+relay's identity for cursor-key purposes — this is consistent with the
+default in `config.example.toml` and the URL hard-coded as the
+`--relay-url` default in the `capture-fixtures` binary.
 
 Config loaded at startup. Environment variables with the `HORIZON_FIREHOSE_` prefix override TOML values, using **`__` (double underscore) as the section separator** and a single underscore inside field names. Examples:
 

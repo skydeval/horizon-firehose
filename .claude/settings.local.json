@@ -28,7 +28,15 @@
       "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"ls /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/crates/proto-blue-ws/src/ && echo '---LIB---' && cat /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/crates/proto-blue-ws/src/lib.rs\")",
       "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cat /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/crates/proto-blue-ws/src/keepalive.rs\")",
       "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cat /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/crates/proto-blue-ws/src/error.rs\")",
-      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test 2>&1 | tail -80\")"
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test 2>&1 | tail -80\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cat /home/chrys/.cargo/git/checkouts/proto-blue-ced1880ca8c9c4a0/05514bb/proto-blue/Cargo.toml | head -80\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo build --bin capture-fixtures 2>&1 | tail -30\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && rm -rf tests/fixtures && cargo run --bin capture-fixtures -- --count 1000 --duration-secs 60 --progress-interval 250 2>&1 | tail -30\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && ls tests/fixtures/ | head -5 && echo --- && ls tests/fixtures/ | wc -l && echo --- && python3 -c 'import json,sys; m=json.load\\(open\\(\\\\\"tests/fixtures/manifest.json\\\\\"\\)\\); print\\(\\\\\"frame_count:\\\\\", m[\\\\\"frame_count\\\\\"]\\); print\\(\\\\\"frames in array:\\\\\", len\\(m[\\\\\"frames\\\\\"]\\)\\); print\\(\\\\\"started:\\\\\", m[\\\\\"capture_started_at\\\\\"]\\); print\\(\\\\\"ended:\\\\\", m[\\\\\"capture_ended_at\\\\\"]\\); print\\(\\\\\"first:\\\\\", m[\\\\\"frames\\\\\"][0]\\); print\\(\\\\\"last:\\\\\", m[\\\\\"frames\\\\\"][-1]\\); sizes=[f[\\\\\"size_bytes\\\\\"] for f in m[\\\\\"frames\\\\\"]]; print\\(f\\\\\"sizes: min={min\\(sizes\\)} max={max\\(sizes\\)} avg={sum\\(sizes\\)//len\\(sizes\\)} total={sum\\(sizes\\)}\\\\\"\\)'\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test --quiet config::tests 2>&1 | tail -10\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo build --quiet 2>&1 | tail -5 && cargo test --quiet 2>&1 | tail -8\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test --quiet 2>&1 | tail -8\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd '/mnt/d/- - CODING/RUST/horizon-firehose' && cargo test --quiet 2>&1 | tail -15\")"
     ]
   }
 }

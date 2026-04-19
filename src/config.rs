@@ -31,10 +31,12 @@ pub const CONFIG_PATH_ENV: &str = "HORIZON_FIREHOSE_CONFIG";
 pub struct Config {
     pub config_version: u32,
 
-    #[serde(default)]
+    // `[relay]` and `[redis]` are required: silent defaults here would
+    // point operators at the wrong relay or the wrong cache and only
+    // surface as a connection failure at runtime. The other sections
+    // below are tuning dials with universal defaults and may be
+    // omitted. See DESIGN.md §4 "required vs. optional sections".
     pub relay: RelayConfig,
-
-    #[serde(default)]
     pub redis: RedisConfig,
 
     #[serde(default)]
@@ -64,19 +66,8 @@ pub struct RelayConfig {
     pub tls_extra_ca_file: String,
 }
 
-impl Default for RelayConfig {
-    fn default() -> Self {
-        Self {
-            url: "wss://bsky.network".to_string(),
-            fallbacks: Vec::new(),
-            reconnect_initial_delay_ms: 1000,
-            reconnect_max_delay_ms: 60_000,
-            failover_threshold: 5,
-            failover_cooldown_seconds: 600,
-            tls_extra_ca_file: String::new(),
-        }
-    }
-}
+// No `Default` impl: `[relay]` is required, and `config.example.toml`
+// is the single documented source of recommended values.
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -88,16 +79,7 @@ pub struct RedisConfig {
     pub cleanup_unknown_cursors: bool,
 }
 
-impl Default for RedisConfig {
-    fn default() -> Self {
-        Self {
-            url: "redis://redis:6379".to_string(),
-            stream_key: "firehose:events".to_string(),
-            max_stream_len: 500_000,
-            cleanup_unknown_cursors: false,
-        }
-    }
-}
+// No `Default` impl: `[redis]` is required, same rationale as `[relay]`.
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -393,6 +375,104 @@ format = "json"
     }
 
     #[test]
+    fn rejects_config_missing_relay_section() {
+        // Strip the entire `[relay]` block out of MINIMAL_CONFIG. With
+        // no `Default` impl and no `#[serde(default)]` on
+        // `Config::relay`, serde must produce a "missing field" error.
+        Jail::expect_with(|jail| {
+            let body = strip_section(MINIMAL_CONFIG, "[relay]");
+            let path = write_config(jail, &body);
+            let err = Config::load(&path).unwrap_err();
+            match err {
+                Error::ConfigLoad { source, .. } => {
+                    let msg = source.to_string();
+                    assert!(
+                        msg.contains("relay"),
+                        "expected error message to name `relay`, got: {msg}"
+                    );
+                }
+                other => panic!("expected ConfigLoad, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_config_missing_redis_section() {
+        Jail::expect_with(|jail| {
+            let body = strip_section(MINIMAL_CONFIG, "[redis]");
+            let path = write_config(jail, &body);
+            let err = Config::load(&path).unwrap_err();
+            match err {
+                Error::ConfigLoad { source, .. } => {
+                    let msg = source.to_string();
+                    assert!(
+                        msg.contains("redis"),
+                        "expected error message to name `redis`, got: {msg}"
+                    );
+                }
+                other => panic!("expected ConfigLoad, got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn accepts_config_omitting_optional_sections() {
+        // [filter], [cursor], [publisher], [logging] are tuning dials
+        // with universal defaults — they may be omitted.
+        let body = "\
+config_version = 1
+
+[relay]
+url = \"wss://bsky.network\"
+reconnect_initial_delay_ms = 1000
+reconnect_max_delay_ms = 60000
+failover_threshold = 5
+failover_cooldown_seconds = 600
+
+[redis]
+url = \"redis://localhost:6379\"
+stream_key = \"firehose:events\"
+max_stream_len = 500000
+";
+        Jail::expect_with(|jail| {
+            let path = write_config(jail, body);
+            let cfg = Config::load(&path).expect("load");
+            // Spot-check a couple of defaulted fields.
+            assert_eq!(cfg.cursor.save_interval_seconds, 5);
+            assert_eq!(cfg.publisher.max_event_size_bytes, 1_048_576);
+            assert_eq!(cfg.logging.format, LogFormat::Json);
+            assert!(cfg.filter.record_types.is_empty());
+            Ok(())
+        });
+    }
+
+    /// Remove an entire `[section]` block (header + all key/value
+    /// lines that follow, up to the next `[` or EOF) from a TOML body.
+    fn strip_section(body: &str, header: &str) -> String {
+        let mut out = String::new();
+        let mut skipping = false;
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            if skipping {
+                if trimmed.starts_with('[') {
+                    skipping = false;
+                } else {
+                    continue;
+                }
+            }
+            if trimmed == header {
+                skipping = true;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
     fn rejects_unknown_top_level_field() {
         Jail::expect_with(|jail| {
             let body = format!("{MINIMAL_CONFIG}\nbogus_field = 42\n");
@@ -556,8 +636,15 @@ format = "json"
     #[test]
     fn example_config_file_loads() {
         // Our shipped config.example.toml must parse and validate.
-        let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
-        let cfg = Config::load(&example).expect("example config loads");
-        assert_eq!(cfg.config_version, SUPPORTED_CONFIG_VERSION);
+        // Wrapped in `Jail` so it serialises with the other env-var
+        // tests — `Config::load` merges process env vars, and other
+        // tests' temporary `HORIZON_FIREHOSE_*` settings would
+        // otherwise race in here when tests run in parallel.
+        Jail::expect_with(|_jail| {
+            let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+            let cfg = Config::load(&example).expect("example config loads");
+            assert_eq!(cfg.config_version, SUPPORTED_CONFIG_VERSION);
+            Ok(())
+        });
     }
 }

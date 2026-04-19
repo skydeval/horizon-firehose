@@ -26,13 +26,20 @@
 config_version = 1
 
 [relay]
-url = "wss://bsky.network"
+# Full firehose XRPC endpoint. Must include the
+# /xrpc/com.atproto.sync.subscribeRepos path — horizon-firehose uses a
+# generic WebSocket client (proto-blue-ws on top of tokio-tungstenite)
+# that does not auto-route to the subscription path the way higher-level
+# ATProto libraries (e.g. Python `atproto`) do.
+url = "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos"
 fallbacks = []
 
-# Example multi-relay configuration:
+# Example multi-relay configuration. Each fallback must also include
+# the XRPC path; sequence numbers are relay-scoped (DESIGN.md §3) so
+# the path is part of the relay identity.
 # fallbacks = [
-#   "wss://relay.fyi",
-#   "wss://relay.blacksky.app",
+#   "wss://relay.fyi/xrpc/com.atproto.sync.subscribeRepos",
+#   "wss://relay.blacksky.app/xrpc/com.atproto.sync.subscribeRepos",
 # ]
 
 reconnect_initial_delay_ms = 1000
