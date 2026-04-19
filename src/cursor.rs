@@ -215,7 +215,7 @@ pub fn spawn_persister<B: StreamBackend>(
     interval: Duration,
 ) -> PersisterHandle {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let task = tokio::spawn(async move {
+    let task = crate::spawn_instrumented("cursor_persister", async move {
         let mut stats = PersisterStats::default();
         let mut ticker = tokio::time::interval(interval);
         // The first tick fires immediately; skip it so we don't hammer

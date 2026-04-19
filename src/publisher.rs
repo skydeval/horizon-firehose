@@ -133,6 +133,16 @@ pub struct PublisherStats {
     /// These advanced the cursor without XADDing anything — e.g.
     /// `#sync` frames the decoder forwarded.
     pub skip_advances: u64,
+    /// Phase 8.5 follow-up finding 4.10: true when `join`/`shutdown`
+    /// surfaced a `JoinError` (the task panicked). In that case the
+    /// numeric fields above are `Default` — the actual pre-panic
+    /// counts are lost with the task's local state. Main's outer
+    /// coordinator still detects the panic via the handle's
+    /// `JoinHandle` in its `select!`, so fault reporting + non-zero
+    /// exit still work; this flag is for `shutdown_metrics`
+    /// accuracy so operators don't misread "zero events published"
+    /// as a clean but silent session.
+    pub task_panicked: bool,
 }
 
 /// Handle to the spawned publisher task.
@@ -157,7 +167,10 @@ impl PublisherHandle {
         let _keepalive = self.shutdown_tx;
         match self.task.await {
             Ok(r) => r,
-            Err(_join_err) => Ok(PublisherStats::default()),
+            Err(_join_err) => Ok(PublisherStats {
+                task_panicked: true,
+                ..PublisherStats::default()
+            }),
         }
     }
 
@@ -172,7 +185,55 @@ impl PublisherHandle {
         let _ = self.shutdown_tx.send(true);
         match self.task.await {
             Ok(r) => r,
-            Err(_join_err) => Ok(PublisherStats::default()),
+            Err(_join_err) => Ok(PublisherStats {
+                task_panicked: true,
+                ..PublisherStats::default()
+            }),
+        }
+    }
+
+    /// Phase 8.5 follow-up finding 2.2: await the task up to
+    /// `budget`, then force-shutdown via the signal. Used by the
+    /// main coordinator's shutdown cascade to guarantee the final
+    /// cursor flush has time to run within the outer
+    /// `SHUTDOWN_BUDGET`. If the budget elapses, the retry loop
+    /// observes the shutdown watch, exits, and the task completes;
+    /// the returned stats reflect events actually published before
+    /// the forced exit.
+    pub async fn join_with_budget(
+        self,
+        budget: Duration,
+    ) -> Result<PublisherStats, PublisherError> {
+        let Self {
+            mut task,
+            shutdown_tx,
+        } = self;
+        tokio::select! {
+            r = &mut task => {
+                // Completed on its own before the budget fired.
+                // Keep the sender alive; the retry loop's select
+                // treats `changed()` on a dropped sender as a ready
+                // branch and would exit prematurely otherwise.
+                let _keepalive = shutdown_tx;
+                match r {
+                    Ok(res) => res,
+                    Err(_join_err) => Ok(PublisherStats {
+                        task_panicked: true,
+                        ..PublisherStats::default()
+                    }),
+                }
+            }
+            _ = tokio::time::sleep(budget) => {
+                // Budget elapsed — force the retry loop out.
+                let _ = shutdown_tx.send(true);
+                match task.await {
+                    Ok(res) => res,
+                    Err(_join_err) => Ok(PublisherStats {
+                        task_panicked: true,
+                        ..PublisherStats::default()
+                    }),
+                }
+            }
         }
     }
 }
@@ -185,7 +246,10 @@ pub fn spawn<B: StreamBackend>(
     metrics: Arc<Metrics>,
 ) -> PublisherHandle {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let task = tokio::spawn(run(backend, cursors, opts, input, shutdown_rx, metrics));
+    let task = crate::spawn_instrumented(
+        "publisher",
+        run(backend, cursors, opts, input, shutdown_rx, metrics),
+    );
     PublisherHandle { task, shutdown_tx }
 }
 
@@ -685,6 +749,74 @@ mod tests {
     }
 
     // ─── Phase 8.5: finding 1.1 — SkipAdvance timing invariant ────
+
+    #[tokio::test]
+    async fn join_with_budget_forces_shutdown_on_elapse() {
+        // Phase 8.5 follow-up finding 2.2: when the publisher is
+        // stuck in the retry loop on an unreachable Redis, the
+        // inner budget must fire and force the task to exit —
+        // otherwise the outer `SHUTDOWN_BUDGET` would consume all
+        // 30s here and starve the final cursor flush.
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        b.set_fail_mode(FailMode::FailNext(10_000)).await;
+        let (tx, rx) = mpsc::channel::<PublishOp>(4);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            PublisherOptions {
+                retry_initial: Duration::from_millis(5),
+                retry_max: Duration::from_millis(20),
+                ..opts(1000, 1 << 20, OversizePolicy::SkipWithLog)
+            },
+            rx,
+            m(),
+        );
+        tx.send(PublishOp::Publish(tiny_commit(1), 42))
+            .await
+            .unwrap();
+
+        // 150ms budget is far shorter than the retry loop's infinite
+        // patience. Must return within that window.
+        let started = std::time::Instant::now();
+        let stats = timeout(
+            Duration::from_millis(500),
+            handle.join_with_budget(Duration::from_millis(150)),
+        )
+        .await
+        .expect("join_with_budget must respect its own budget")
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "join_with_budget should have returned near its 150ms budget, not {elapsed:?}"
+        );
+        assert_eq!(stats.events_published, 0);
+        // Cursor must NOT have advanced — the invariant holds even
+        // under budget-triggered force-exit.
+        assert_eq!(c.get(RELAY).await, None);
+    }
+
+    #[tokio::test]
+    async fn task_panicked_flag_is_set_when_task_panics() {
+        // Phase 8.5 follow-up finding 4.10: a panicking publisher
+        // task should surface as `stats.task_panicked = true`
+        // rather than zero stats silently replacing the real ones.
+        // We can't ergonomically force the publisher to panic from
+        // outside — simulate by synthesising a PublisherHandle
+        // whose task IS a panicking spawn.
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        let task: JoinHandle<Result<PublisherStats, PublisherError>> = tokio::spawn(async {
+            panic!("synthetic publisher panic");
+        });
+        let handle = PublisherHandle { task, shutdown_tx };
+        let stats = handle.join().await.unwrap();
+        assert!(
+            stats.task_panicked,
+            "join must report task_panicked=true for panicked task"
+        );
+        assert_eq!(stats.events_published, 0);
+    }
 
     #[tokio::test]
     async fn skip_op_advances_cursor_without_xadd() {

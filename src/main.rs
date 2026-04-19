@@ -127,41 +127,118 @@ fn init_tracing(cfg: &Config) {
     }
 }
 
-/// Check that `relay.tls_extra_ca_file` (if set) points at a readable
-/// file before we start long-running work. Fails fast on typos.
+/// Phase 8.5 follow-up finding 4.2: reject `tls_extra_ca_file` at
+/// startup. The previous posture (accept-and-warn) was honest about
+/// the inertness but misleading in practice — the consumer connects
+/// anyway, the TLS handshake uses system roots only, the operator's
+/// configured private CA is silently ignored, and the eventual
+/// connection failure looks like an unrelated TLS error. Rejecting
+/// with a concrete "not plumbed yet, see proto-blue#4" message is
+/// the honest posture until [proto-blue#4](https://github.com/dollspace-gay/proto-blue/issues/4)
+/// exposes a `ClientConfig` hook.
 ///
-/// **Limitation**: proto-blue-ws uses `tokio_tungstenite::connect_async`
-/// under the hood, which takes no `ClientConfig`, so this CA bundle
-/// is not currently plumbed into the actual TLS handshake. Phase 5
-/// validates the file so operators know the path is wrong *at
-/// startup* rather than discovering it only after proto-blue-ws
-/// grows a `connect_async_tls_with_config` path. See DESIGN.md §3
-/// "TLS verification" — the additive-CA config is accepted but
-/// inert until upstream exposes the config hook.
-///
-/// See upstream feature request at
-/// <https://github.com/dollspace-gay/proto-blue/issues/4> for
-/// tracking. When proto-blue-ws exposes a rustls `ClientConfig`
-/// hook, this validation step becomes the first half of actual CA
-/// injection (load + parse the PEM → install as additive roots on
-/// the `ClientConfig` passed to `connect_async_tls_with_config`).
+/// When that upstream lands, this becomes the first half of actual
+/// CA injection (load + parse the PEM → install as additive roots
+/// on the `ClientConfig` passed to `connect_async_tls_with_config`).
 fn validate_tls_extra_ca(cfg: &Config) -> Result<(), Error> {
     let path = cfg.relay.tls_extra_ca_file.trim();
     if path.is_empty() {
         return Ok(());
     }
-    let p = std::path::PathBuf::from(path);
-    match std::fs::metadata(&p) {
-        Ok(_) => {
-            warn!(
-                path = %p.display(),
-                "relay.tls_extra_ca_file is set but not plumbed through to proto-blue-ws; \
-                 file is validated for existence, not loaded into the TLS stack yet"
+    Err(Error::ConfigValidation(format!(
+        "relay.tls_extra_ca_file is set to {path:?} but this crate's \
+         WebSocket client (proto-blue-ws) does not yet expose a TLS \
+         `ClientConfig` hook, so the additive CA bundle would be \
+         silently ignored at TLS handshake time. This used to be \
+         accepted with a WARN, but inert-but-accepted configs hide \
+         real TLS failures behind unrelated-looking errors. \
+         Either remove this config key (falling back to native-tls \
+         with system roots), or wait for proto-blue#4 to land — see \
+         DESIGN.md §3 'TLS verification' for the rollback plan when \
+         rustls becomes pluggable upstream."
+    )))
+}
+
+/// Phase 8.5 follow-up finding 2.1: spawn a tokio task, catch any
+/// panic inside with `FutureExt::catch_unwind`, emit a structured
+/// ERROR event that names the task before propagating, then
+/// `resume_unwind` so the `JoinHandle` still resolves with
+/// `Err(JoinError)` exactly as tokio's default panic propagation
+/// would.
+///
+/// The attribution problem without this helper: when `ws_reader`
+/// panics, its `frames_tx` drops, the decoder sees its input
+/// channel close, and exits cleanly with `Ok(_)`. `main`'s
+/// coordinator `select!` observes the decoder handle completing
+/// first (because ws_reader's handle is owned by the decoder task),
+/// records `panicked: false` for the decoder, and emits a misleading
+/// "decoder exited unexpectedly" log. The `task_panicked` event
+/// from `spawn_instrumented` fires *inside* ws_reader's task before
+/// any of that cascade begins, so root cause is in the log stream
+/// regardless of which handle the coordinator eventually observes.
+pub(crate) fn spawn_instrumented<F, T>(name: &'static str, fut: F) -> tokio::task::JoinHandle<T>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(instrumented_future(name, fut))
+}
+
+async fn instrumented_future<F, T>(name: &'static str, fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(v) => v,
+        Err(payload) => {
+            // `&*payload` is an explicit `&(dyn Any + Send)`. Don't
+            // change this to `&payload` (which would be
+            // `&Box<dyn Any + Send>`) — investigated Phase 8.5
+            // follow-up: auto-deref coercion goes through Box's own
+            // `Any` impl, so `downcast_ref::<String>()` would ask
+            // "is this a Box<dyn Any + Send>?" (yes) rather than
+            // "is the inner value a String?" (also yes, but
+            // invisible through the outer Box's TypeId). The
+            // explicit deref exposes the trait object so the
+            // downcast sees the real concrete type.
+            let panic_message = panic_payload_to_string(&*payload);
+            error!(
+                target: "horizon_firehose::metrics",
+                event_type = "task_panicked",
+                task_name = %name,
+                panic_message = %panic_message,
+                "task '{}' panicked — propagating to supervisor",
+                name
             );
-            Ok(())
+            std::panic::resume_unwind(payload);
         }
-        Err(source) => Err(Error::TlsExtraCaFile { path: p, source }),
     }
+}
+
+/// Best-effort string extraction from a `catch_unwind` panic payload.
+/// Rust panics commonly carry either `&'static str` (literal panics)
+/// or `String` (format-args panics). We try both. `futures-util`'s
+/// `CatchUnwind` unwraps the `Box<dyn Any>` we receive, but the
+/// interior type follows the same rules either way.
+/// Caller must pass an explicitly-dereffed `&(dyn Any + Send)` —
+/// `&*payload` where `payload: Box<dyn Any + Send>`. Passing
+/// `&payload` directly lets method resolution find Box's own Any
+/// impl, and every downcast returns `None` because it checks
+/// against `TypeId::of::<Box<dyn Any + Send>>()` instead of the
+/// inner concrete type. See the call site's comment.
+fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    format!(
+        "<panic payload not representable as str; type_id={:?}>",
+        payload.type_id()
+    )
 }
 
 /// Phase 8.5 review finding 4.5: build the concrete, copy-pasteable
@@ -228,7 +305,9 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
 
     // Global shutdown signal: one watch, cloned everywhere.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(listen_for_signals(shutdown_tx.clone()));
+    // Signal-listener runs for the lifetime of the process; a panic
+    // here would be highly unusual but still attribute-worthy.
+    spawn_instrumented("signal_listener", listen_for_signals(shutdown_tx.clone()));
 
     // Redis connect with indefinite retry. If a signal fires first,
     // we unwind cleanly without ever having started the pipeline.
@@ -470,6 +549,14 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
     // is exactly one source of truth for "how many events did we
     // publish this run".
     let totals = metrics.shutdown_totals();
+    // Phase 8.5 follow-up finding 4.10: surface whether the
+    // publisher task panicked. If it did, the per-task stats in
+    // `shutdown_result.publisher` are zeroed (the panic lost them)
+    // but the shared-metrics totals are still accurate.
+    let publisher_panicked = matches!(
+        &shutdown_result.publisher,
+        Ok(stats) if stats.task_panicked
+    );
     let final_cursor_per_relay: std::collections::HashMap<String, u64> =
         shutdown_result.final_cursors.iter().cloned().collect();
     info!(
@@ -484,6 +571,7 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
         total_skipped_frames = totals.total_skipped_frames,
         total_oversize_events = totals.total_oversize_events,
         total_unknown_frame_types = totals.total_unknown_frame_types,
+        publisher_task_panicked = publisher_panicked,
         final_cursor_per_relay = %serde_json::to_string(&final_cursor_per_relay).unwrap_or_default(),
         "shutdown complete"
     );
@@ -522,6 +610,11 @@ struct ShutdownResult {
 /// close is what drives exit, and channel close only happens when the
 /// previous stage has finished draining. Exactly the §3 ordering.
 #[allow(clippy::too_many_arguments)]
+/// Phase 8.5 follow-up finding 2.2: inner budget for the publisher's
+/// drain-and-retry phase, sized so the final cursor flush has
+/// guaranteed time inside the outer `SHUTDOWN_BUDGET`.
+const PUBLISHER_JOIN_BUDGET: Duration = Duration::from_secs(20);
+
 async fn shutdown_cascade<B: StreamBackend>(
     decoder_h: decoder::DecoderHandle,
     router_h: router::RouterHandle,
@@ -539,14 +632,27 @@ async fn shutdown_cascade<B: StreamBackend>(
     // channel.
     let _router_stats = router_h.shutdown().await;
     // Publisher sees the filtered channel close, drains (with Redis
-    // retry as needed), closes. join() (not shutdown()) because we
-    // want to let mid-flight retries resolve rather than abort them.
-    let publisher_result = publisher_h.join().await;
+    // retry as needed), closes. Phase 8.5 follow-up finding 2.2:
+    // bound the join to `PUBLISHER_JOIN_BUDGET` so even a publisher
+    // stuck in the Redis retry loop can't consume the whole
+    // `SHUTDOWN_BUDGET` and starve the final cursor-flush step that
+    // follows. On budget overrun, signal shutdown so the retry loop
+    // exits on its own select — the in-flight event is lost from
+    // the publisher's POV, but the cursor correspondingly doesn't
+    // advance past it (DESIGN.md §3 invariant).
+    let publisher_result = publisher_h.join_with_budget(PUBLISHER_JOIN_BUDGET).await;
 
-    // One last cursor flush AFTER the publisher has drained — this
-    // is the final "last XADDed seq" write required by §3. Doing it
-    // here means the persister's periodic ticks can have missed the
-    // last few advances without risk.
+    // Phase 8.5 follow-up finding 2.4: stop the periodic persister
+    // *before* the final `persist_all`, not after. Previously a
+    // persister tick could fire concurrently with the final flush;
+    // the result is still consistent (cursor advances are monotonic
+    // so both writes land) but the ordering is now cleaner and
+    // `persist_all.outcome.failed` is no longer polluted by an
+    // independent periodic write racing on the same key.
+    let _persister_stats = persister_h.shutdown().await;
+
+    // One last cursor flush after both the publisher has drained
+    // AND the persister has stopped — sole-writer ordering.
     let outcome = cursors.persist_all(backend.as_ref()).await;
     if outcome.failed > 0 {
         warn!(
@@ -556,9 +662,6 @@ async fn shutdown_cascade<B: StreamBackend>(
         );
     }
     let final_cursors = cursors.snapshot().await;
-
-    // Stop the periodic persister now that we've done the final write.
-    let _persister_stats = persister_h.shutdown().await;
 
     // Metrics emitter is *not* in the pipeline cascade — it observes
     // the global shutdown watch directly. By the time we get here

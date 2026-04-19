@@ -136,18 +136,27 @@ pub trait StreamBackend: Send + Sync + 'static {
 /// automatic reconnection; the publisher's retry loop handles the
 /// window between a command failing and the manager re-establishing
 /// the connection.
+/// Production backend. Each clone shares the same underlying
+/// `ConnectionManager` (which is internally `Arc`-backed and
+/// multiplexes commands) — no `Arc<Mutex<_>>` is needed. Phase 8.5
+/// follow-up finding 4.7: the old `Arc<Mutex<ConnectionManager>>`
+/// serialised every Redis call behind a single lock, defeating
+/// ConnectionManager's internal multiplexing. Today's single-publisher
+/// topology doesn't observe contention, but the moment a second
+/// Redis user is added (the metrics emitter's `XRANGE` is the first
+/// real user — it contends with the publisher's `XADD` on the old
+/// lock) throughput is bottlenecked. Removing the wrapping lock
+/// gives concurrent readers/writers proper multiplexed access.
 #[derive(Clone)]
 pub struct RedisBackend {
-    conn: Arc<Mutex<ConnectionManager>>,
+    conn: ConnectionManager,
 }
 
 impl RedisBackend {
     pub async fn connect(url: &str) -> Result<Self, BackendError> {
         let client = redis::Client::open(url)?;
         let conn = ConnectionManager::new(client).await?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        Ok(Self { conn })
     }
 
     /// Connect with indefinite exponential backoff, checking `shutdown`
@@ -186,6 +195,26 @@ impl RedisBackend {
                     return Ok(Some(b));
                 }
                 Err(err) => {
+                    // Phase 8.5 follow-up finding 4.8: fast-fail on
+                    // errors that no amount of retrying will fix.
+                    // Auth failures, malformed URL / TLS / client
+                    // config, and generic client-error responses are
+                    // all "operator must fix config" categories —
+                    // retrying indefinitely just hides the problem.
+                    // Transient errors (IO, timeout, server busy,
+                    // replica loading) continue to retry per the
+                    // DESIGN.md §3 "never exit on Redis outage" rule.
+                    if is_fatal_redis_error(&err) {
+                        tracing::error!(
+                            target: "horizon_firehose::metrics",
+                            event_type = "redis_startup_fatal",
+                            attempt,
+                            error = %err,
+                            "Redis connect failed with a non-retryable error — \
+                             refusing to retry (operator must fix config)"
+                        );
+                        return Err(err);
+                    }
                     let now = std::time::Instant::now();
                     let warn_due = match last_warn {
                         None => true,
@@ -233,8 +262,7 @@ impl StreamBackend for RedisBackend {
         ];
         let id: String = self
             .conn
-            .lock()
-            .await
+            .clone()
             .xadd_maxlen(
                 stream_key,
                 redis::streams::StreamMaxlen::Approx(max_len as usize),
@@ -246,12 +274,12 @@ impl StreamBackend for RedisBackend {
     }
 
     async fn set_cursor(&self, key: &str, seq: u64) -> Result<(), BackendError> {
-        let _: () = self.conn.lock().await.set(key, seq.to_string()).await?;
+        let _: () = self.conn.clone().set(key, seq.to_string()).await?;
         Ok(())
     }
 
     async fn get_cursor(&self, key: &str) -> Result<Option<u64>, BackendError> {
-        let raw: Option<String> = self.conn.lock().await.get(key).await?;
+        let raw: Option<String> = self.conn.clone().get(key).await?;
         match raw {
             None => Ok(None),
             Some(s) => s
@@ -265,7 +293,7 @@ impl StreamBackend for RedisBackend {
     }
 
     async fn xlen(&self, stream_key: &str) -> Result<u64, BackendError> {
-        let n: u64 = self.conn.lock().await.xlen(stream_key).await?;
+        let n: u64 = self.conn.clone().xlen(stream_key).await?;
         Ok(n)
     }
 
@@ -278,8 +306,7 @@ impl StreamBackend for RedisBackend {
         // `id` string "<ms>-<seq>".
         let reply: redis::streams::StreamRangeReply = self
             .conn
-            .lock()
-            .await
+            .clone()
             .xrange_count(stream_key, "-", "+", 1)
             .await?;
         Ok(reply
@@ -287,6 +314,34 @@ impl StreamBackend for RedisBackend {
             .first()
             .and_then(|entry| parse_stream_id_ms(&entry.id)))
     }
+}
+
+/// Phase 8.5 follow-up finding 4.8: classify a Redis error as fatal
+/// (operator must fix config) vs transient (worth retrying).
+///
+/// Fatal:
+/// - `AuthenticationFailed` — wrong password / ACL. Retrying with
+///   the same credential is pointless.
+/// - `InvalidClientConfig` — malformed URL, bad TLS setup,
+///   unsupported feature combo.
+/// - `ClientError` — caught on our side before the request went out;
+///   the request itself is malformed.
+/// - `TypeError` — structural mismatch; wouldn't fire on connect
+///   normally, but if it does it's not "wait and retry" material.
+///
+/// Everything else is transient and eligible for the startup-retry
+/// loop's exponential backoff.
+fn is_fatal_redis_error(err: &BackendError) -> bool {
+    let BackendError::Redis(re) = err else {
+        return false;
+    };
+    matches!(
+        re.kind(),
+        redis::ErrorKind::AuthenticationFailed
+            | redis::ErrorKind::InvalidClientConfig
+            | redis::ErrorKind::ClientError
+            | redis::ErrorKind::TypeError
+    )
 }
 
 /// Parse the `<ms>-<seq>` ID form Redis streams use into a UTC
@@ -494,9 +549,14 @@ impl StreamBackend for InMemoryBackend {
         &self,
         stream_key: &str,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, BackendError> {
-        // Same reasoning as `xlen` — observation path, not subject
-        // to fail injection.
-        let state = self.inner.lock().await;
+        // Unlike `xlen`, this IS subject to `FailMode`: the metrics
+        // emitter calls it on the hot path (every tick), and Phase
+        // 8.5 follow-up finding 4.6 specifically tests the
+        // `redis_healthy = false` path by injecting failures here.
+        // Exempting it would make that test unable to simulate a
+        // Redis outage.
+        let mut state = self.inner.lock().await;
+        Self::maybe_inject_failure(&mut state, "oldest_event_timestamp")?;
         Ok(state
             .streams
             .get(stream_key)
@@ -523,6 +583,64 @@ mod tests {
         assert_eq!(b.get_cursor("c").await.unwrap(), None);
         b.set_cursor("c", 42).await.unwrap();
         assert_eq!(b.get_cursor("c").await.unwrap(), Some(42));
+    }
+
+    #[test]
+    fn is_fatal_redis_error_classifies_each_kind() {
+        use redis::ErrorKind;
+        // Synthesise RedisError values via the `(ErrorKind, &'static str)`
+        // `From` impl the crate exposes.
+        fn make(kind: ErrorKind) -> BackendError {
+            BackendError::Redis(redis::RedisError::from((kind, "synthetic")))
+        }
+
+        // Fatal categories.
+        assert!(is_fatal_redis_error(&make(ErrorKind::AuthenticationFailed)));
+        assert!(is_fatal_redis_error(&make(ErrorKind::InvalidClientConfig)));
+        assert!(is_fatal_redis_error(&make(ErrorKind::ClientError)));
+        assert!(is_fatal_redis_error(&make(ErrorKind::TypeError)));
+
+        // Transient — MUST continue to retry per DESIGN.md §3.
+        assert!(!is_fatal_redis_error(&make(ErrorKind::IoError)));
+        assert!(!is_fatal_redis_error(&make(ErrorKind::BusyLoadingError)));
+        assert!(!is_fatal_redis_error(&make(ErrorKind::TryAgain)));
+        assert!(!is_fatal_redis_error(&make(ErrorKind::ClusterDown)));
+        assert!(!is_fatal_redis_error(&make(ErrorKind::MasterDown)));
+        assert!(!is_fatal_redis_error(&make(ErrorKind::ResponseError)));
+
+        // Non-Redis variants (injected failures, malformed cursor)
+        // are not the concern of this helper.
+        assert!(!is_fatal_redis_error(&BackendError::Injected("x".into())));
+        assert!(!is_fatal_redis_error(&BackendError::MalformedCursor {
+            key: "k".into(),
+            value: "v".into()
+        }));
+    }
+
+    #[tokio::test]
+    async fn connect_with_retry_fast_fails_on_malformed_url() {
+        // Invalid URL scheme → `redis::Client::open` returns
+        // `ErrorKind::InvalidClientConfig` at the first attempt.
+        // Must return the error immediately, not loop.
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let start = std::time::Instant::now();
+        let result = RedisBackend::connect_with_retry(
+            "not-a-valid-scheme://nope",
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(30),
+            rx,
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "malformed URL must surface as Err, not retried into oblivion"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "fast-fail should be nearly instant; took {elapsed:?}"
+        );
     }
 
     #[tokio::test]

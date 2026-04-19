@@ -47,16 +47,6 @@ pub enum Error {
     /// orchestrator restarts us with a fresh state.
     #[error("graceful shutdown exceeded 30s budget; forcing non-zero exit")]
     ShutdownBudgetExceeded,
-
-    /// `relay.tls_extra_ca_file` points at a path that doesn't exist
-    /// or isn't readable. We fail fast on startup rather than letting
-    /// the first TLS handshake error surface mid-run.
-    #[error("relay.tls_extra_ca_file {path:?} could not be read: {source}")]
-    TlsExtraCaFile {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

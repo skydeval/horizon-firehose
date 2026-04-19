@@ -132,7 +132,7 @@ pub fn spawn(
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let filter: HashSet<String> = opts.record_types.into_iter().collect();
 
-    let task = tokio::spawn(async move {
+    let task = crate::spawn_instrumented("router", async move {
         let mut stats = RouterStats::default();
 
         loop {

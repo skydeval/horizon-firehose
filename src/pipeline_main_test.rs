@@ -531,6 +531,7 @@ async fn periodic_metrics_emits_with_expected_fields() {
         "channel_depths",
         "cursor_ages_seconds",
         "oldest_event_age_seconds",
+        "redis_healthy",
         "uptime_seconds",
     ] {
         assert!(
@@ -556,6 +557,83 @@ async fn periodic_metrics_emits_with_expected_fields() {
     assert!(
         age_for_test.as_u64().is_some(),
         "per-relay age must be a number; got {age_for_test:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn redis_healthy_false_and_oldest_event_age_null_when_backend_errors() {
+    // Phase 8.5 follow-up finding 4.6: on Redis outage, the
+    // metric must report `redis_healthy = false` AND
+    // `oldest_event_age_seconds` must serialize as JSON `null`,
+    // not `0`. Previously the field read `0` in both "stream is
+    // empty" and "Redis unreachable" cases — alerts couldn't
+    // distinguish "everything's fine, no backlog" from "Redis
+    // is down".
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let captured = capture::Captured::default();
+    let subscriber = tracing_subscriber::registry().with(capture::CaptureLayer(captured.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let backend = Arc::new(InMemoryBackend::new());
+    // Every call fails — simulates Redis outage.
+    backend.set_fail_mode(FailMode::FailNext(10_000)).await;
+
+    let cursors = Cursors::new();
+    let metrics = Metrics::new();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let (e_tx, _e_rx) = mpsc::channel::<PublishOp>(16);
+    let (f_tx, _f_rx) = mpsc::channel::<PublishOp>(16);
+    let (w_tx, _w_rx) = mpsc::channel::<crate::ws_reader::Frame>(16);
+    let gauges = crate::metrics::ChannelGauges {
+        ws_to_decoder: w_tx.downgrade(),
+        decoder_to_router: e_tx.downgrade(),
+        router_to_publisher: f_tx.downgrade(),
+    };
+    let throwaway = ws_reader::spawn_with_cursors(
+        relay_cfg("ws://127.0.0.1:1".into()),
+        WsReaderOptions::default(),
+        cursors.clone(),
+        shutdown_rx.clone(),
+        Metrics::new(),
+    );
+
+    let handle = crate::metrics::spawn_emitter(
+        metrics.clone(),
+        gauges,
+        cursors.clone(),
+        throwaway.state_reader(),
+        backend.clone(),
+        "firehose:events".to_string(),
+        std::time::Instant::now(),
+        Duration::from_millis(50),
+        shutdown_rx.clone(),
+    );
+
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    let _ = shutdown_tx.send(true);
+    handle.join().await;
+    throwaway.shutdown().await;
+
+    let records = captured.records.lock().unwrap().clone();
+    let periodic = records
+        .iter()
+        .find(|r| r.field("event_type") == Some("periodic_metrics"))
+        .expect("at least one periodic_metrics event");
+
+    assert_eq!(
+        periodic.field("redis_healthy"),
+        Some("false"),
+        "Redis is failing; redis_healthy must be false"
+    );
+    // `oldest_event_age_seconds` is emitted as JSON serialization
+    // of `Option<u64>`. On outage → `null`.
+    let oldest = periodic.field("oldest_event_age_seconds").unwrap_or("");
+    assert_eq!(
+        oldest.trim(),
+        "null",
+        "on Redis outage, oldest_event_age_seconds must be null — got {oldest:?}"
     );
 }
 
@@ -716,6 +794,81 @@ async fn periodic_metrics_delta_captures_increments_between_ticks() {
     assert_eq!(sum, 30, "deltas must cover the full 30-count increment");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_instrumented_emits_task_panicked_before_propagating() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // Phase 8.5 follow-up finding 2.1: verify the attribution log
+    // fires inside the panicking task (so the root cause name is in
+    // the log stream), and that the JoinHandle still resolves with
+    // an Err(JoinError) so main's coordinator `select!` sees the
+    // panic the same way tokio's default propagation would.
+    let captured = capture::Captured::default();
+    let subscriber = tracing_subscriber::registry().with(capture::CaptureLayer(captured.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // `panic!("literal")` in modern Rust / edition 2024 ends up
+    // with a panic payload type that is NOT one of `&'static str` or
+    // `String` — the macro routes through `fmt::Arguments` and the
+    // concrete payload type is a private stdlib wrapper (type_id
+    // not publicly nameable). Using `panic_any` with an explicit
+    // `String` sidesteps that: the payload is a real `String` we
+    // can downcast to for the log body.
+    let handle = crate::spawn_instrumented("unit_test_victim_task", async {
+        std::panic::panic_any(String::from(
+            "synthetic panic carries this message verbatim",
+        ))
+    });
+
+    // JoinHandle must resolve with JoinError (panic propagated).
+    let result = handle.await;
+    assert!(
+        result.is_err(),
+        "spawn_instrumented must propagate panic via JoinHandle Err"
+    );
+
+    // The structured task_panicked event must have been emitted
+    // before propagation, with the task name intact.
+    let records = captured.records.lock().unwrap().clone();
+    let panic_events: Vec<_> = records
+        .iter()
+        .filter(|r| r.field("event_type") == Some("task_panicked"))
+        .collect();
+    assert_eq!(
+        panic_events.len(),
+        1,
+        "expected exactly one task_panicked event, got {panic_events:?}"
+    );
+    let ev = panic_events[0];
+    assert_eq!(ev.field("task_name"), Some("unit_test_victim_task"));
+    let msg = ev.field("panic_message").unwrap_or("");
+    assert!(
+        msg.contains("synthetic panic carries this message verbatim"),
+        "panic_message field should contain the panic body; got {msg:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_instrumented_does_not_emit_on_clean_exit() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let captured = capture::Captured::default();
+    let subscriber = tracing_subscriber::registry().with(capture::CaptureLayer(captured.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let handle = crate::spawn_instrumented("clean_task", async { 42 });
+    let result = handle.await.unwrap();
+    assert_eq!(result, 42);
+
+    let records = captured.records.lock().unwrap().clone();
+    assert!(
+        !records
+            .iter()
+            .any(|r| r.field("event_type") == Some("task_panicked")),
+        "clean exit must not emit task_panicked; got {records:?}"
+    );
+}
+
 #[test]
 fn malformed_cursor_remediation_includes_everything_an_operator_needs() {
     // Phase 8.5 review finding 4.5: at 3am an operator debugging
@@ -793,6 +946,70 @@ fn malformed_cursor_remediation_labels_unknown_relay_clearly() {
     );
     assert!(msg.contains("firehose:cursor:deadbeef"));
     assert!(msg.contains("redis-cli -u \"$REDIS_URL\" DEL firehose:cursor:deadbeef"));
+}
+
+#[test]
+fn tls_extra_ca_file_is_rejected_at_startup_when_set() {
+    // Phase 8.5 follow-up finding 4.2: `tls_extra_ca_file` used to be
+    // accepted-with-WARN and silently ignored at handshake time. Now
+    // it's a hard startup failure until proto-blue#4 lands.
+    use crate::config::{
+        Config, CursorConfig, FilterConfig, LogFormat, LoggingConfig, OversizePolicy,
+        ProtocolErrorPolicy, PublisherConfig, RedisConfig, RelayConfig, StaleCursorPolicy,
+    };
+
+    fn cfg_with(tls: &str) -> Config {
+        Config {
+            config_version: 1,
+            relay: RelayConfig {
+                url: "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos".into(),
+                fallbacks: vec![],
+                reconnect_initial_delay_ms: 1000,
+                reconnect_max_delay_ms: 60_000,
+                failover_threshold: 5,
+                failover_cooldown_seconds: 600,
+                tls_extra_ca_file: tls.into(),
+            },
+            redis: RedisConfig {
+                url: "redis://localhost:6379".into(),
+                stream_key: "firehose:events".into(),
+                max_stream_len: 500_000,
+                cleanup_unknown_cursors: false,
+            },
+            filter: FilterConfig {
+                record_types: vec![],
+            },
+            cursor: CursorConfig {
+                save_interval_seconds: 5,
+                on_stale_cursor: StaleCursorPolicy::LiveTip,
+                on_protocol_error: ProtocolErrorPolicy::ReconnectFromLiveTip,
+            },
+            publisher: PublisherConfig {
+                max_event_size_bytes: 1_048_576,
+                on_oversize: OversizePolicy::SkipWithLog,
+            },
+            logging: LoggingConfig {
+                level: "info".into(),
+                format: LogFormat::Json,
+            },
+        }
+    }
+
+    // Empty → accepted.
+    crate::validate_tls_extra_ca(&cfg_with("")).expect("empty value must pass");
+    // Set → rejected with a message that references proto-blue#4 so
+    // the operator finds the upstream context quickly.
+    let err = crate::validate_tls_extra_ca(&cfg_with("/etc/ssl/custom-ca.pem"))
+        .expect_err("non-empty tls_extra_ca_file must be rejected at startup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("proto-blue#4"),
+        "error message should reference the upstream tracking issue; got: {msg}"
+    );
+    assert!(
+        msg.contains("/etc/ssl/custom-ca.pem"),
+        "error should echo the configured path so the operator finds it; got: {msg}"
+    );
 }
 
 #[tokio::test]

@@ -443,8 +443,6 @@ pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeE
     stack.push(2);
 
     let mut pos = 0usize;
-    // Max observed depth for error reporting.
-    let mut max_observed: u32 = 0;
 
     while let Some(&top) = stack.last() {
         // If the innermost container is complete, pop upward until we
@@ -475,7 +473,6 @@ pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeE
                 max: max_depth,
             });
         }
-        max_observed = max_observed.max(depth_now);
 
         let initial = bytes[pos];
         pos += 1;
@@ -570,7 +567,6 @@ pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeE
         }
     }
 
-    let _ = max_observed;
     Ok(())
 }
 
@@ -772,7 +768,7 @@ pub fn spawn(
     metrics: Arc<Metrics>,
     control: WsReaderControl,
 ) -> DecoderHandle {
-    let task = tokio::spawn(async move {
+    let task = crate::spawn_instrumented("decoder", async move {
         let mut stats = DecoderStats::default();
         let mut consecutive_errors: u32 = 0;
 
@@ -1237,6 +1233,99 @@ mod tests {
         assert!(
             !failures.iter().any(|(_, e)| e.contains("PANIC")),
             "decoder panicked on at least one frame"
+        );
+    }
+
+    /// Phase 8.5 follow-up finding 3.6: a curated subset of frames
+    /// committed under `tests/golden/fixtures/curated_*.bin` gives CI
+    /// real decoder coverage without requiring the 1000-frame bulk
+    /// corpus (which is gitignored and only exists on dev machines
+    /// that have run `capture-fixtures`).
+    ///
+    /// Every committed frame must decode cleanly. Unlike
+    /// `decodes_all_captured_fixtures`, which is exploratory and
+    /// tolerates up to 50% decode failures across the unvetted bulk
+    /// corpus, this test is strict: a regression that breaks any
+    /// curated frame fails CI immediately. Adding a new curated
+    /// fixture that doesn't decode is a review signal ("why is this
+    /// here?") rather than a permanent warning.
+    #[test]
+    fn decodes_all_curated_fixtures() {
+        let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/fixtures");
+        if !fixtures_dir.is_dir() {
+            eprintln!("SKIP curated-fixture test: tests/golden/fixtures/ missing");
+            return;
+        }
+
+        let mut curated_paths: Vec<std::path::PathBuf> = std::fs::read_dir(&fixtures_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().and_then(|s| s.to_str()) == Some("bin")
+                    && p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|n| n.starts_with("curated_"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        curated_paths.sort();
+
+        if curated_paths.is_empty() {
+            eprintln!(
+                "SKIP curated-fixture test: no tests/golden/fixtures/curated_*.bin \
+                 committed. Populate via the script under Phase 8.5 follow-up 3.6."
+            );
+            return;
+        }
+
+        let mut kinds: BTreeMap<&'static str, u32> = BTreeMap::new();
+        let mut record_types: BTreeMap<String, u32> = BTreeMap::new();
+        let mut failures: Vec<(String, String)> = Vec::new();
+
+        for path in &curated_paths {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    failures.push((name.to_string(), format!("read: {e}")));
+                    continue;
+                }
+            };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode_frame(&bytes, "ws://curated-test-relay")
+            })) {
+                Ok(Ok(frame)) => {
+                    *kinds.entry(frame_kind_label(&frame)).or_insert(0) += 1;
+                    if let DecodedFrame::Event {
+                        event: Event::Commit(c),
+                        ..
+                    } = &frame
+                    {
+                        for op in &c.ops {
+                            if let Some(rec) = &op.record {
+                                if let Some(t) = rec.get("$type").and_then(|v| v.as_str()) {
+                                    *record_types.entry(t.into()).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => failures.push((name.to_string(), e.to_string())),
+                Err(_) => failures.push((name.to_string(), "PANIC during decode".into())),
+            }
+        }
+
+        eprintln!(
+            "curated fixture coverage: {} frame(s), kinds={:?}, $types={}",
+            curated_paths.len(),
+            kinds,
+            record_types.len()
+        );
+
+        assert!(
+            failures.is_empty(),
+            "committed curated fixtures must all decode. Failures: {failures:?}"
         );
     }
 

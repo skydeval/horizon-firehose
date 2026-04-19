@@ -192,7 +192,7 @@ horizon-firehose/
 
 - **Task panic.** `tokio::select!` in main watches all tasks. On panic, log at ERROR, attempt graceful shutdown (save cursor for active relay), and exit non-zero for orchestrator restart.
 
-- **TLS verification.** `rustls` with system roots, verification enforced in release builds. Optional additive CA file via `tls_extra_ca_file` config. `--insecure-dev-mode` CLI flag is `#[cfg(debug_assertions)]` gated and cannot compile into release.
+- **TLS verification.** Actual TLS is handled by `tokio-tungstenite`'s `native-tls` feature, pulled in transitively through `proto-blue-ws`. Verification is enforced by the system's TLS stack (OpenSSL on Linux, SChannel on Windows, Security.framework on macOS) against system roots. `--insecure-dev-mode` CLI flag is `#[cfg(debug_assertions)]` gated and cannot compile into release. **The original plan was rustls-with-system-roots** (Phase 0 intent), but `proto-blue-ws` uses `tokio_tungstenite::connect_async` with no `ClientConfig` hook, so rustls couldn't be wired in without an upstream change (tracked as [proto-blue#4](https://github.com/dollspace-gay/proto-blue/issues/4)). When that lands, DESIGN reverts to rustls and the native-tls transitive goes away. The `tls_extra_ca_file` config is **rejected at startup** in the interim — see §3 "TLS extra CA file" below. Phase 8.5 follow-up findings 4.2 + 4.3.
 
 ### relay supervisor (failover)
 

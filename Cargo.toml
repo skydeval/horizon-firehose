@@ -42,9 +42,14 @@ clap = { version = "4", features = ["derive"] }
 # Phase 3). Default features include `clock` for `Utc::now()`.
 chrono = "0.4"
 
-# TLS (rustls with system roots)
-rustls = "0.23"
-rustls-native-certs = "0.8"
+# TLS — actual handshake is done by `tokio-tungstenite`'s `native-tls`
+# feature, pulled in transitively through `proto-blue-ws`. We had
+# `rustls` + `rustls-native-certs` here earlier when the plan was
+# rustls-with-system-roots, but proto-blue-ws uses
+# `tokio_tungstenite::connect_async` (no `ClientConfig` hook) so the
+# rustls deps were never wired in. See DESIGN.md §3 "TLS verification"
+# and proto-blue#4 for the upstream feature that would flip this back
+# to rustls.
 
 # proto-blue (pinned to commit SHA — see "Working with proto-blue" in README)
 proto-blue-api = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
@@ -53,6 +58,12 @@ proto-blue-lex-cbor = { git = "https://github.com/dollspace-gay/proto-blue", rev
 proto-blue-lex-data = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
 proto-blue-repo = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
 proto-blue-syntax = { git = "https://github.com/dollspace-gay/proto-blue", rev = "05514bbf4a10342e83eb1b97c372b741dc701144" }
+
+# FutureExt::catch_unwind for the spawn_instrumented helper
+# (Phase 8.5 finding 2.1). Already in the tree as a transitive dep
+# via proto-blue-ws / tokio-tungstenite; making the dep explicit so
+# this crate can rely on the `std` + `async-await` features.
+futures-util = "0.3"
 
 [dev-dependencies]
 # Testing

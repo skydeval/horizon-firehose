@@ -261,7 +261,7 @@ pub fn spawn_emitter<B: StreamBackend>(
     interval: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> EmitterHandle {
-    let task = tokio::spawn(async move {
+    let task = crate::spawn_instrumented("metrics_emitter", async move {
         let mut ticker = tokio::time::interval(interval);
         // The first tick fires immediately; skip it so we don't emit
         // a "just started, everything's zero" event on top of
@@ -286,14 +286,32 @@ pub fn spawn_emitter<B: StreamBackend>(
                     let depths = channels.sample();
                     let cursor_ages = cursors.age_seconds(now).await;
                     let ws_snapshot = ws_state.snapshot(now).await;
-                    let oldest = backend
-                        .oldest_event_timestamp(&stream_key)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|ts| {
-                            (chrono::Utc::now() - ts).num_seconds().max(0) as u64
-                        });
+                    // Phase 8.5 follow-up finding 4.6: distinguish
+                    // three states for `oldest_event_age_seconds`:
+                    //   (a) Redis reachable, stream has entries →
+                    //       real age in seconds.
+                    //   (b) Redis reachable, stream is empty →
+                    //       `oldest_event_age_seconds = null`,
+                    //       `redis_healthy = true`.
+                    //   (c) Redis unreachable / XRANGE errored →
+                    //       `oldest_event_age_seconds = null`,
+                    //       `redis_healthy = false`.
+                    // The old code reported `0` in all three cases,
+                    // so alerts on "oldest_event_age_seconds > 300"
+                    // couldn't fire during Redis outages. Operators
+                    // should alert on `redis_healthy = false`
+                    // instead for that class of incident.
+                    let (oldest_age, redis_healthy) =
+                        match backend.oldest_event_timestamp(&stream_key).await {
+                            Ok(Some(ts)) => {
+                                let age =
+                                    (chrono::Utc::now() - ts).num_seconds().max(0) as u64;
+                                (Some(age), true)
+                            }
+                            Ok(None) => (None, true),
+                            Err(_) => (None, false),
+                        };
+                    let oldest_json = serde_json::to_string(&oldest_age).unwrap_or_default();
 
                     info!(
                         target: "horizon_firehose::metrics",
@@ -315,7 +333,8 @@ pub fn spawn_emitter<B: StreamBackend>(
                         active_relay = ws_snapshot.active_relay.as_deref().unwrap_or(""),
                         channel_depths = %serde_json::to_string(&depths).unwrap_or_default(),
                         cursor_ages_seconds = %serde_json::to_string(&cursor_ages).unwrap_or_default(),
-                        oldest_event_age_seconds = oldest.unwrap_or(0),
+                        oldest_event_age_seconds = %oldest_json,
+                        redis_healthy = redis_healthy,
                         uptime_seconds = started_at.elapsed().as_secs(),
                         "periodic_metrics"
                     );

@@ -149,6 +149,13 @@ struct SharedState {
     active_index: Option<usize>,
     total_reconnects: u64,
     reconnect_history: VecDeque<Instant>,
+    /// Phase 8.5 follow-up finding 2.3: set by `reset_failures` when
+    /// the clean-operation threshold is reached mid-connection;
+    /// observed (and cleared) by the supervisor loop to reset the
+    /// local `backoff` variable. Without this, a succeed → disconnect
+    /// cycle would carry the pre-reset compounded backoff forward
+    /// even though `consecutive_failures` had gone back to zero.
+    clean_since_last_backoff: bool,
 }
 
 impl SharedState {
@@ -161,6 +168,7 @@ impl SharedState {
             active_index: None,
             total_reconnects: 0,
             reconnect_history: VecDeque::new(),
+            clean_since_last_backoff: false,
         }
     }
 
@@ -213,6 +221,19 @@ impl SharedState {
         let r = &mut self.relays[idx];
         r.consecutive_failures = 0;
         r.cooldown_until = None;
+        // Phase 8.5 follow-up finding 2.3: a clean-operation reset
+        // must also signal the supervisor to reset its local
+        // `backoff` variable. Otherwise the next disconnect would
+        // sleep for the compounded value from the pre-reset
+        // failures, even though we've proven the relay is healthy.
+        self.clean_since_last_backoff = true;
+    }
+
+    /// Read-and-clear the clean-operation flag. The supervisor calls
+    /// this after each `run_one_connection` returns; if true, it
+    /// resets its local backoff to the initial value.
+    fn take_clean_flag(&mut self) -> bool {
+        std::mem::replace(&mut self.clean_since_last_backoff, false)
     }
 
     fn metrics(&mut self, now: Instant) -> ReconnectMetrics {
@@ -419,16 +440,19 @@ fn spawn_internal(
     let frames_weak = frames_tx.downgrade();
     let state = Arc::new(Mutex::new(SharedState::from_config(&cfg)));
     let force_reconnect = Arc::new(Notify::new());
-    let task = tokio::spawn(supervisor(
-        cfg,
-        opts,
-        frames_tx,
-        shutdown_rx,
-        state.clone(),
-        cursors,
-        metrics,
-        force_reconnect.clone(),
-    ));
+    let task = crate::spawn_instrumented(
+        "ws_reader_supervisor",
+        supervisor(
+            cfg,
+            opts,
+            frames_tx,
+            shutdown_rx,
+            state.clone(),
+            cursors,
+            metrics,
+            force_reconnect.clone(),
+        ),
+    );
     WsReader {
         frames_rx,
         task,
@@ -515,13 +539,24 @@ async fn supervisor(
                 break 'outer;
             }
             ref failure => {
-                let (consecutive, reconnect_metrics) = {
+                // Phase 8.5 follow-up finding 2.3: if clean
+                // operation was achieved at any point during this
+                // connection, the supervisor's local `backoff`
+                // must reset to `initial_backoff` before the next
+                // disconnect grows it. Otherwise a long-running
+                // healthy session that eventually disconnects would
+                // sleep for the pre-reset compounded value.
+                let (consecutive, reconnect_metrics, had_clean_op) = {
                     let mut s = state.lock().unwrap();
+                    let had_clean_op = s.take_clean_flag();
                     s.record_failure(idx, Instant::now(), cfg.failover_threshold, cooldown);
                     let consecutive = s.relays[idx].consecutive_failures;
                     let rm = s.metrics(Instant::now());
-                    (consecutive, rm)
+                    (consecutive, rm, had_clean_op)
                 };
+                if had_clean_op {
+                    backoff = initial_backoff;
+                }
                 info!(
                     target: "horizon_firehose::metrics",
                     event_type = "relay_disconnected",
@@ -530,6 +565,7 @@ async fn supervisor(
                     consecutive_failures = consecutive,
                     total_reconnects_since_start = reconnect_metrics.total_reconnects_since_start,
                     reconnects_last_hour = reconnect_metrics.reconnects_last_hour,
+                    backoff_ms = backoff.as_millis() as u64,
                     "relay disconnected; will reattempt"
                 );
 
@@ -780,6 +816,69 @@ mod tests {
         s.reset_failures(0);
         assert_eq!(s.relays[0].consecutive_failures, 0);
         assert!(s.relays[0].cooldown_until.is_none());
+    }
+
+    // ─── Phase 8.5 follow-up finding 2.3: backoff reset signal ─────
+
+    #[test]
+    fn reset_failures_signals_clean_since_last_backoff() {
+        let mut s = SharedState::from_config(&relay_cfg("ws://p", &[]));
+        assert!(
+            !s.clean_since_last_backoff,
+            "fresh state starts with flag false"
+        );
+        s.reset_failures(0);
+        assert!(
+            s.clean_since_last_backoff,
+            "reset_failures must set the backoff-reset signal"
+        );
+    }
+
+    #[test]
+    fn take_clean_flag_is_one_shot() {
+        let mut s = SharedState::from_config(&relay_cfg("ws://p", &[]));
+        s.reset_failures(0);
+        assert!(s.take_clean_flag(), "first take returns true");
+        assert!(
+            !s.take_clean_flag(),
+            "second take returns false — flag is cleared by take"
+        );
+        assert!(!s.clean_since_last_backoff);
+    }
+
+    #[test]
+    fn backoff_reset_scenario_fail_fail_succeed_fail() {
+        // Simulates: fail → fail → (succeed long enough to reset) → fail.
+        // After the clean operation, the next failure's backoff sleep
+        // should be `initial_backoff`, not the compounded value.
+        let mut s = SharedState::from_config(&relay_cfg("ws://p", &[]));
+        let now = Instant::now();
+
+        // Fail x2.
+        s.record_failure(0, now, 5, Duration::from_secs(10));
+        s.record_failure(0, now, 5, Duration::from_secs(10));
+        assert_eq!(s.relays[0].consecutive_failures, 2);
+
+        // Clean operation happens; reset_failures sets the flag.
+        s.reset_failures(0);
+        assert_eq!(s.relays[0].consecutive_failures, 0);
+        assert!(s.clean_since_last_backoff);
+
+        // Supervisor picks up the flag, resets its local backoff.
+        let reset = s.take_clean_flag();
+        assert!(reset);
+
+        // Next failure.
+        s.record_failure(0, now, 5, Duration::from_secs(10));
+        assert_eq!(s.relays[0].consecutive_failures, 1);
+        // The supervisor's backoff would now grow from
+        // `initial_backoff`, not from the pre-reset compounded value.
+        // Observable in the structured log line `backoff_ms` —
+        // unit-test level we just verify the flag contract.
+        assert!(
+            !s.clean_since_last_backoff,
+            "flag was consumed by take_clean_flag; failure doesn't re-set it"
+        );
     }
 
     #[test]
