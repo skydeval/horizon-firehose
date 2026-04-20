@@ -1,0 +1,48 @@
+# Exclude everything the Docker build context doesn't need. Each
+# line below saves either COPY time, layer-cache invalidation noise,
+# or both.
+
+# Local build artefacts (can be multi-GB; the container does its
+# own `cargo build` from a clean state).
+target/
+**/target/
+
+# Git metadata — not needed for a production image. If we ever want
+# to stamp a git SHA into the binary we'll pass it as a build arg
+# instead of leaving the full repo history in the build context.
+.git/
+.gitignore
+.gitattributes
+
+# Editor / tooling state.
+.claude/
+.vscode/
+.idea/
+
+# CI config — lives in the repo but irrelevant to the image build.
+.github/
+
+# Docs — useful for humans reading the repo, not needed at runtime
+# or in the compile step.
+README.md
+DESIGN.md
+LICENSE*
+
+# Test fixtures + captured frames (8 MB+ and `cargo build --bin
+# horizon-firehose` never touches them).
+tests/
+
+# Cargo config override (was a rustc-ICE workaround; removed from
+# main but keep ignored in case it returns as a local-only shim).
+.cargo/
+
+# Environment scratch files someone might stage locally.
+.env
+.env.*
+*.env
+
+# Docker artefacts themselves — don't send the Dockerfile back into
+# itself as context.
+Dockerfile
+.dockerignore
+examples/

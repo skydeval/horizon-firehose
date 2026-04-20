@@ -1,0 +1,77 @@
+# Example docker-compose for horizon-firehose + Redis.
+#
+# THIS IS REFERENCE MATERIAL, NOT A DEPLOY-AS-IS CONFIG. Real
+# deployments vary on Redis hosting (managed service vs self-hosted),
+# volumes, networking, secret management, and log shipping. Copy this
+# file out of examples/ and adapt for your infrastructure.
+#
+# What this example shows:
+#   - Two services on a private network (horizon-firehose reaches
+#     Redis by the service name `redis`).
+#   - A read-only bind mount of `./config.toml` into the consumer
+#     container. Edit your copy of the config so `[redis] url =
+#     "redis://redis:6379"` matches the redis service name.
+#   - Named volume `redis-data` for AOF / RDB persistence.
+#   - `restart: unless-stopped` so the orchestrator restarts on
+#     non-zero exits (the DESIGN.md §3 pattern for "task panicked →
+#     non-zero → orchestrator restarts").
+#   - `stop_grace_period: 35s` so SIGTERM → shutdown cascade has the
+#     full 30 s budget documented in DESIGN.md §3 before Docker's
+#     SIGKILL arrives. Default 10 s is tight for the drain path.
+
+services:
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --save
+      - "60 1000"
+    volumes:
+      - redis-data:/data
+    # No host-port publish by default; consumers reach Redis over
+    # the compose network. Uncomment to expose for local tooling:
+    # ports:
+    #   - "127.0.0.1:6379:6379"
+    restart: unless-stopped
+
+  horizon-firehose:
+    # Build locally from the repo root, or pin to a published tag
+    # once registry publication is set up. Keep `pull_policy: build`
+    # commented so `docker compose up --build` is still the source
+    # of truth.
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    # image: ghcr.io/skydeval/horizon-firehose:latest
+    depends_on:
+      - redis
+    volumes:
+      # Your config.toml — must point [redis] url at `redis://redis:6379`
+      # to reach the service above by its compose name.
+      - ./config.toml:/app/config.toml:ro
+    # Override individual config fields here if you'd rather not bake
+    # them into the TOML (DESIGN.md §4 env-var schema). These take
+    # precedence over the TOML.
+    environment:
+      # HORIZON_FIREHOSE_REDIS__URL: "redis://redis:6379"
+      HORIZON_FIREHOSE_LOGGING__FORMAT: "json"
+      HORIZON_FIREHOSE_LOGGING__LEVEL: "info"
+    restart: unless-stopped
+    # See Dockerfile comments on signals: horizon-firehose handles
+    # SIGTERM via the §3 shutdown cascade with a 30 s budget. Give
+    # Docker 35 s before it escalates to SIGKILL.
+    stop_grace_period: 35s
+    # Ship logs off the host. The binary emits one JSON object per
+    # line when logging.format = "json"; any Docker logging driver
+    # that understands JSON (Loki, Fluentd, CloudWatch Logs,
+    # OpenTelemetry Collector sidecar) can parse them directly.
+    # logging:
+    #   driver: "json-file"
+    #   options:
+    #     max-size: "100m"
+    #     max-file: "5"
+
+volumes:
+  redis-data:

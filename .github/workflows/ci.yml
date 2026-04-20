@@ -107,3 +107,57 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─── Docker image build + smoke test ───────────────────────────────
+  # Phase 9: build the multi-stage production image and confirm the
+  # binary inside actually runs (proves toolchain unification —
+  # glibc ABI from the `rust:1.85-bookworm` builder has to match the
+  # glibc the `distroless/cc-debian12` runtime carries, and rustls
+  # + native-tls both need to link against libssl correctly). Does
+  # NOT push to any registry; image publication is deliberately a
+  # separate concern.
+  docker-build:
+    name: docker build + smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load to local daemon, no registry push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: horizon-firehose:ci
+          # Reuse layers from prior main-branch builds. `mode=max`
+          # caches every intermediate stage (not just the final
+          # image) so the builder-stage `cargo build` layers hit
+          # cache too on unchanged Cargo.lock runs.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check image size (≤ 50 MiB)
+        run: |
+          set -euo pipefail
+          SIZE=$(docker image inspect horizon-firehose:ci --format='{{.Size}}')
+          LIMIT=$((50 * 1024 * 1024))
+          SIZE_MIB=$(awk "BEGIN{printf \"%.2f\", ${SIZE}/1024/1024}")
+          echo "image size: ${SIZE} bytes (${SIZE_MIB} MiB), limit: ${LIMIT} bytes (50 MiB)"
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "::error::horizon-firehose image is ${SIZE_MIB} MiB — exceeds the 50 MiB budget from Phase 9."
+            echo "Usual causes: a new heavy dep pulled in, LTO disabled, strip removed from profile.release, or the runtime base image updated. Audit the recent changes before bumping the limit."
+            exit 1
+          fi
+
+      - name: Smoke test (binary runs `--version` inside the image)
+        run: |
+          set -euo pipefail
+          OUT=$(docker run --rm horizon-firehose:ci --version)
+          echo "got: ${OUT}"
+          # Expect the exact `horizon-firehose X.Y.Z` shape. If this
+          # ever needs a pre-release suffix (`-rc.1`, `-dev`), widen
+          # the regex deliberately — surprises here usually mean the
+          # image is running a different binary than we expect.
+          echo "${OUT}" | grep -Eq '^horizon-firehose [0-9]+\.[0-9]+\.[0-9]+$'

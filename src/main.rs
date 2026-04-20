@@ -83,16 +83,77 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 const CHANNEL_BUFFER: usize = 1024;
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            // Tracing may not be initialised yet (config could fail
-            // before we set up subscribers), so emit on stderr too.
-            eprintln!("fatal: {err}");
-            error!(error = %err, "horizon-firehose exiting non-zero");
-            ExitCode::FAILURE
+    match handle_cli_args() {
+        CliAction::Run => match run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                // Tracing may not be initialised yet (config could fail
+                // before we set up subscribers), so emit on stderr too.
+                eprintln!("fatal: {err}");
+                error!(error = %err, "horizon-firehose exiting non-zero");
+                ExitCode::FAILURE
+            }
+        },
+        CliAction::Exit(code) => code,
+    }
+}
+
+enum CliAction {
+    Run,
+    Exit(ExitCode),
+}
+
+/// Minimal CLI-arg handling. Phase 9 added this for two reasons:
+///   1. `--version` lets the Dockerfile smoke test confirm the image
+///      built and linked correctly without needing a real config.
+///   2. `--help` points ops at DESIGN.md + config.example.toml when
+///      someone runs the binary blind on a new host.
+///
+/// Anything beyond those two is rejected rather than silently ignored
+/// — operator typos ("--cofig" etc.) should be loud, not ignored.
+/// We intentionally don't wire clap in here; a two-flag CLI doesn't
+/// justify the dep and `capture-fixtures` already uses clap if we
+/// ever need richer parsing.
+fn handle_cli_args() -> CliAction {
+    let mut args = std::env::args().skip(1);
+    let Some(arg) = args.next() else {
+        return CliAction::Run;
+    };
+    match arg.as_str() {
+        "--version" | "-V" => {
+            println!("horizon-firehose {CONSUMER_VERSION}");
+            CliAction::Exit(ExitCode::SUCCESS)
+        }
+        "--help" | "-h" => {
+            print_help();
+            CliAction::Exit(ExitCode::SUCCESS)
+        }
+        other => {
+            eprintln!("horizon-firehose: unrecognised argument '{other}'");
+            eprintln!("try `--help` for usage");
+            CliAction::Exit(ExitCode::from(2))
         }
     }
+}
+
+fn print_help() {
+    println!(
+        "horizon-firehose {CONSUMER_VERSION}\n\
+         \n\
+         A Rust-based ATProto firehose consumer with CBOR/CAR decoding,\n\
+         per-relay failover, and Redis stream publishing.\n\
+         \n\
+         USAGE:\n    \
+             horizon-firehose [--version | --help]\n\
+         \n\
+         The binary takes no positional arguments. Configuration is loaded\n\
+         from ./config.toml by default; override with the HORIZON_FIREHOSE_CONFIG\n\
+         environment variable. Individual fields can be overridden with\n\
+         HORIZON_FIREHOSE_* env vars — see config.example.toml for the full\n\
+         schema.\n\
+         \n\
+         See DESIGN.md for architecture and operational guidance."
+    );
 }
 
 fn run() -> Result<(), Error> {
