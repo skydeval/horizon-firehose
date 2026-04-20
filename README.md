@@ -2,11 +2,9 @@
 
 [![CI](https://github.com/skydeval/horizon-firehose/actions/workflows/ci.yml/badge.svg)](https://github.com/skydeval/horizon-firehose/actions/workflows/ci.yml)
 
-For the story of building this, see [RETROSPECTIVE.md](RETROSPECTIVE.md).
-
 A Rust-based ATProto firehose consumer with CBOR/CAR decoding, per-relay failover, and Redis stream publishing.
 
-**Status:** in active development. See [DESIGN.md](DESIGN.md) for the full specification.
+**Status**: deployed in parallel-run alongside the existing Python firehose consumer. See DESIGN.md for architecture, DEPLOYMENT.md for operational details, and RETROSPECTIVE.md for the story of building it.
 
 ## Running with Docker
 
