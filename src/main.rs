@@ -58,6 +58,7 @@ mod publisher;
 mod router;
 mod ws_reader;
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -97,16 +98,16 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Error> {
     let path = Config::resolve_path();
     let cfg = Config::load(&path)?;
-    validate_tls_extra_ca(&cfg)?;
+    let tls_config = load_tls_client_config(&cfg)?;
 
     init_tracing(&cfg);
-    emit_startup_metrics(&cfg, &path);
+    emit_startup_metrics(&cfg, &path, tls_config.is_some());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
-    runtime.block_on(run_async(cfg))
+    runtime.block_on(run_async(cfg, tls_config))
 }
 
 fn init_tracing(cfg: &Config) {
@@ -127,36 +128,94 @@ fn init_tracing(cfg: &Config) {
     }
 }
 
-/// Phase 8.5 follow-up finding 4.2: reject `tls_extra_ca_file` at
-/// startup. The previous posture (accept-and-warn) was honest about
-/// the inertness but misleading in practice — the consumer connects
-/// anyway, the TLS handshake uses system roots only, the operator's
-/// configured private CA is silently ignored, and the eventual
-/// connection failure looks like an unrelated TLS error. Rejecting
-/// with a concrete "not plumbed yet, see proto-blue#4" message is
-/// the honest posture until [proto-blue#4](https://github.com/dollspace-gay/proto-blue/issues/4)
-/// exposes a `ClientConfig` hook.
+/// Phase 8.7: load `relay.tls_extra_ca_file` into a
+/// [`rustls::ClientConfig`] (additive to the OS trust store) so the
+/// downstream [`proto_blue_ws::TungsteniteConnector::with_rustls_config`]
+/// hook can enforce it during the TLS handshake. Returns:
 ///
-/// When that upstream lands, this becomes the first half of actual
-/// CA injection (load + parse the PEM → install as additive roots
-/// on the `ClientConfig` passed to `connect_async_tls_with_config`).
-fn validate_tls_extra_ca(cfg: &Config) -> Result<(), Error> {
-    let path = cfg.relay.tls_extra_ca_file.trim();
-    if path.is_empty() {
-        return Ok(());
+/// - `Ok(None)` when the config field is empty — the default
+///   `tokio-tungstenite` + `native-tls` path handles TLS against
+///   system roots, no rustls involved.
+/// - `Ok(Some(Arc<ClientConfig>))` when the file loaded cleanly —
+///   system roots *plus* the CERTIFICATE entries from the PEM are
+///   installed, so private CAs extend (not replace) public trust.
+/// - `Err(Error::TlsExtraCaFile)` at the first failure point.
+///   We intentionally fail startup rather than warn-and-continue —
+///   Phase 8.5 finding 4.2's lesson was that a silently-ignored CA
+///   turns into an unrelated-looking TLS error at handshake time,
+///   which is exactly the shape of failure ops can't debug.
+///
+/// Errors are attributed to one of four points:
+/// (a) the file can't be read, (b) the PEM parser couldn't tokenise
+/// it, (c) it parsed but contained zero `CERTIFICATE` entries,
+/// (d) `RootCertStore::add` rejected a cert (malformed DER inside a
+/// well-formed PEM wrapper).
+fn load_tls_client_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, Error> {
+    let path_str = cfg.relay.tls_extra_ca_file.trim();
+    if path_str.is_empty() {
+        return Ok(None);
     }
-    Err(Error::ConfigValidation(format!(
-        "relay.tls_extra_ca_file is set to {path:?} but this crate's \
-         WebSocket client (proto-blue-ws) does not yet expose a TLS \
-         `ClientConfig` hook, so the additive CA bundle would be \
-         silently ignored at TLS handshake time. This used to be \
-         accepted with a WARN, but inert-but-accepted configs hide \
-         real TLS failures behind unrelated-looking errors. \
-         Either remove this config key (falling back to native-tls \
-         with system roots), or wait for proto-blue#4 to land — see \
-         DESIGN.md §3 'TLS verification' for the rollback plan when \
-         rustls becomes pluggable upstream."
-    )))
+    let path = PathBuf::from(path_str);
+    let config = build_rustls_config_from_pem(&path)?;
+    Ok(Some(Arc::new(config)))
+}
+
+fn build_rustls_config_from_pem(path: &Path) -> Result<rustls::ClientConfig, Error> {
+    let pem_bytes = std::fs::read(path).map_err(|e| Error::TlsExtraCaFile {
+        path: path.to_path_buf(),
+        reason: format!("failed to read: {e}"),
+    })?;
+
+    let mut roots = rustls::RootCertStore::empty();
+
+    // System roots first. Individual cert failures inside the OS
+    // trust store shouldn't refuse startup (some system stores carry
+    // pre-expired or malformed intermediates) — log and proceed with
+    // whatever loaded successfully.
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        warn!(
+            error_count = native.errors.len(),
+            "some OS trust-store certs failed to load; continuing with the subset that loaded"
+        );
+    }
+    for cert in native.certs {
+        let _ = roots.add(cert);
+    }
+
+    // Custom roots from PEM, additive to the system store above.
+    let mut reader = std::io::BufReader::new(&pem_bytes[..]);
+    let custom: Vec<_> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::TlsExtraCaFile {
+            path: path.to_path_buf(),
+            reason: format!("failed to parse PEM: {e}"),
+        })?;
+    if custom.is_empty() {
+        return Err(Error::TlsExtraCaFile {
+            path: path.to_path_buf(),
+            reason: "no CERTIFICATE entries found in PEM file".into(),
+        });
+    }
+    let custom_count = custom.len();
+    for cert in custom {
+        roots.add(cert).map_err(|e| Error::TlsExtraCaFile {
+            path: path.to_path_buf(),
+            reason: format!("failed to add cert to root store: {e}"),
+        })?;
+    }
+
+    info!(
+        target: "horizon_firehose::metrics",
+        event_type = "tls_extra_ca_loaded",
+        path = %path.display(),
+        custom_cert_count = custom_count,
+        "loaded tls_extra_ca_file additive to system roots"
+    );
+
+    Ok(rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
 }
 
 /// Phase 8.5 follow-up finding 2.1: spawn a tokio task, catch any
@@ -266,7 +325,7 @@ pub(crate) fn malformed_cursor_remediation(relay: &str, key: &str, value: &str) 
     )
 }
 
-pub(crate) fn emit_startup_metrics(cfg: &Config, path: &std::path::Path) {
+pub(crate) fn emit_startup_metrics(cfg: &Config, path: &std::path::Path, custom_ca_loaded: bool) {
     // Phase 8.5 review finding 4.4: belt-and-suspenders sanitization.
     // Config-level validation already rejects userinfo-bearing relay
     // URLs (see config::validate_ws_url), so these `sanitize_ws_url`
@@ -289,6 +348,7 @@ pub(crate) fn emit_startup_metrics(cfg: &Config, path: &std::path::Path) {
         "redis_url_host": cfg.redis_url_host(),
         "max_stream_len": cfg.redis.max_stream_len,
         "filter_nsid_count": cfg.filter.record_types.len(),
+        "tls_custom_ca_loaded": custom_ca_loaded,
     });
 
     info!(
@@ -300,7 +360,10 @@ pub(crate) fn emit_startup_metrics(cfg: &Config, path: &std::path::Path) {
     );
 }
 
-async fn run_async(cfg: Config) -> Result<(), Error> {
+async fn run_async(
+    cfg: Config,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+) -> Result<(), Error> {
     let started_at = Instant::now();
 
     // Global shutdown signal: one watch, cloned everywhere.
@@ -395,7 +458,10 @@ async fn run_async(cfg: Config) -> Result<(), Error> {
     // up; the tasks all run concurrently.
     let ws_reader = ws_reader::spawn_with_cursors(
         cfg.relay.clone(),
-        ws_reader::WsReaderOptions::default(),
+        ws_reader::WsReaderOptions {
+            tls_config: tls_config.clone(),
+            ..ws_reader::WsReaderOptions::default()
+        },
         cursors.clone(),
         shutdown_rx.clone(),
         metrics.clone(),

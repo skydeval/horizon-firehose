@@ -33,6 +33,17 @@ pub enum Error {
     #[error("config validation failed: {0}")]
     ConfigValidation(String),
 
+    /// `relay.tls_extra_ca_file` is set but we couldn't build a
+    /// [`rustls::ClientConfig`] from it — either the file is
+    /// unreadable, the PEM is malformed, or no `CERTIFICATE` entries
+    /// were found. Caught at startup so an operator-configured CA
+    /// never fails silently at the TLS handshake (Phase 8.5
+    /// adversarial review finding 4.2, closed in Phase 8.7 by
+    /// proto-blue 0.2.5's `TungsteniteConnector::with_rustls_config`
+    /// hook).
+    #[error("tls_extra_ca_file {path}: {reason}")]
+    TlsExtraCaFile { path: PathBuf, reason: String },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

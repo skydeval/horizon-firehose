@@ -192,7 +192,17 @@ horizon-firehose/
 
 - **Task panic.** `tokio::select!` in main watches all tasks. On panic, log at ERROR, attempt graceful shutdown (save cursor for active relay), and exit non-zero for orchestrator restart.
 
-- **TLS verification.** Actual TLS is handled by `tokio-tungstenite`'s `native-tls` feature, pulled in transitively through `proto-blue-ws`. Verification is enforced by the system's TLS stack (OpenSSL on Linux, SChannel on Windows, Security.framework on macOS) against system roots. `--insecure-dev-mode` CLI flag is `#[cfg(debug_assertions)]` gated and cannot compile into release. **The original plan was rustls-with-system-roots** (Phase 0 intent), but `proto-blue-ws` uses `tokio_tungstenite::connect_async` with no `ClientConfig` hook, so rustls couldn't be wired in without an upstream change (tracked as [proto-blue#4](https://github.com/dollspace-gay/proto-blue/issues/4)). When that lands, DESIGN reverts to rustls and the native-tls transitive goes away. The `tls_extra_ca_file` config is **rejected at startup** in the interim — see §3 "TLS extra CA file" below. Phase 8.5 follow-up findings 4.2 + 4.3.
+- **TLS verification.** Two TLS paths compile into the binary and the config picks between them per-deployment:
+
+  1. **Default (`tls_extra_ca_file = ""`):** `tokio-tungstenite`'s `native-tls` feature, pulled in transitively through `proto-blue-ws`. The system TLS stack (OpenSSL on Linux, SChannel on Windows, Security.framework on macOS) verifies against system roots. Rustls never touches a handshake on this path — it compiles in only so option (2) is available. For the common public-relay deployment this is the only path in effect.
+
+  2. **Custom CA (`tls_extra_ca_file = "/path/to/ca.pem"`):** `rustls` with system roots loaded via `rustls-native-certs`, plus every `CERTIFICATE` entry from the configured PEM file additive on top. The resulting `Arc<rustls::ClientConfig>` is handed to `TungsteniteConnector::with_rustls_config` at ws_reader startup; `connect_async_tls_with_config(Connector::Rustls(...))` then enforces it at every handshake.
+
+  Custom-CA loading happens **at startup, synchronously, before the tokio runtime exists.** A missing file, a malformed PEM, a zero-certificate file, or a DER that `RootCertStore::add` rejects all produce `Error::TlsExtraCaFile` with the configured path echoed back. This is deliberate: Phase 8.5 finding 4.2 established that a silently-ignored CA turns into an unrelated-looking TLS handshake error at first connect, which operators can't debug. Startup failure is the clearer posture.
+
+  `--insecure-dev-mode` CLI flag stays `#[cfg(debug_assertions)]` gated and cannot compile into release regardless of which TLS path is active. Phase 8.7 closed adversarial review finding 4.2 (inert `tls_extra_ca_file`) using proto-blue-ws 0.2.5's `TungsteniteConnector::with_rustls_config` hook, which closed [proto-blue#4](https://github.com/dollspace-gay/proto-blue/issues/4).
+
+  **Phase 11 TODO:** smoke-test the rustls path end-to-end against a mock relay serving a cert signed by a test-only internal CA. Unit tests verify config loading (parse failures, missing entries, valid PEM accepted) but don't exercise the actual handshake against a custom-rooted server — that needs an integration harness with a TLS-serving mock.
 
 ### relay supervisor (failover)
 
@@ -554,7 +564,7 @@ The consumer rejects unknown top-level version numbers with a migration guide re
 
 - [ ] Release builds cannot be compiled with `--insecure-dev-mode`
 - [ ] TLS certificate verification enforced in release builds against system roots
-- [ ] `tls_extra_ca_file` config loads additional CA bundles additive to system roots
+- [ ] `tls_extra_ca_file` loaded in a smoke test against a mock relay with an internal-CA-signed cert (Phase 8.7 landed the plumbing and startup-time parse validation; handshake integration is deferred to Phase 11)
 - [ ] `startup_metrics` only emits config fields on the explicit allowlist
 - [ ] No credentials, tokens, or full URLs with userinfo appear in any log output
 

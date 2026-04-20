@@ -948,67 +948,182 @@ fn malformed_cursor_remediation_labels_unknown_relay_clearly() {
     assert!(msg.contains("redis-cli -u \"$REDIS_URL\" DEL firehose:cursor:deadbeef"));
 }
 
-#[test]
-fn tls_extra_ca_file_is_rejected_at_startup_when_set() {
-    // Phase 8.5 follow-up finding 4.2: `tls_extra_ca_file` used to be
-    // accepted-with-WARN and silently ignored at handshake time. Now
-    // it's a hard startup failure until proto-blue#4 lands.
+/// Self-signed RSA cert generated with
+/// `openssl req -x509 -newkey rsa:2048 -nodes -keyout /dev/null \
+///     -out - -days 3650 -subj '/CN=horizon-test-ca'`. Shape-only
+/// fixture: rustls doesn't validate the chain at `add` time, just
+/// that the DER parses as a well-formed X.509.
+const VALID_TEST_CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIDFTCCAf2gAwIBAgIUHnDVt5kv824CloB0fu5rdPf6XEYwDQYJKoZIhvcNAQEL
+BQAwGjEYMBYGA1UEAwwPaG9yaXpvbi10ZXN0LWNhMB4XDTI2MDQyMDAwMDk1OVoX
+DTM2MDQxNzAwMDk1OVowGjEYMBYGA1UEAwwPaG9yaXpvbi10ZXN0LWNhMIIBIjAN
+BgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3cJYienkltVL5xC+MRTLPNOmoAgJ
+JnMwnAnut8UEtSOmax+uW00/JCTelmK1yGhaSOYgutCebuzhtzsqzA4ma7OIhVzr
+nZY/GS/eodcOfg7/FYDsyjBGwikxoCmIzG0ZTrBF0xsQlaBkjtNIxiPmGKno74Yz
++iFVtgpsY+6RrHrBSxN0qN4Dk/da5LXD0QXQsnefCRsPGn2t3zufio7qLnofUWtu
+UGC9+nNQYhWTwe3zd/ZzhkhwUqxbp/iUmpubBoQDa/PrHBXXFMSLmMcKikevLfs5
+CyGvwR45ExtpWwjTqejs/yBAA57fPHLMbFQcDMTSHCgeH0bnpRK0J/cAtwIDAQAB
+o1MwUTAdBgNVHQ4EFgQUNkYRMntoo0hFqrrJuJM/R51Qq30wHwYDVR0jBBgwFoAU
+NkYRMntoo0hFqrrJuJM/R51Qq30wDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0B
+AQsFAAOCAQEAI+a5HicW7ey0BxmCMX2KnwT00SD0oC2qJIK1ozFQ0xvJXdMP5Ipd
+xUuYKaBTzjYTku8VZ1u5ppwPude0AoZ7Isk54aMAea8yAM8G5gSQiaHn1WbG6yGq
++vaFdn0Rnj8U9a7qS4IrnyX5sx9SxhM2r+ko3kuaAlzxNGFOZs4pWLswR0hcRX/O
+l8J9ME23ZSBgGzOK8/v3n3PKr5VdOhn0/GT/jdgShcBqsjcPW79hncmXhHZg/+7U
+1djsppdsAa5UVKgiZxTH84y9E29JgWCloTlu5RvTlXzN7vsXFvXrkyCprp+q/qjS
+ZapPt6wCG5AXCsXIOoyp3EbgzWP5oZVRBg==
+-----END CERTIFICATE-----
+";
+
+fn cfg_with_tls(tls: &str) -> crate::config::Config {
     use crate::config::{
         Config, CursorConfig, FilterConfig, LogFormat, LoggingConfig, OversizePolicy,
         ProtocolErrorPolicy, PublisherConfig, RedisConfig, RelayConfig, StaleCursorPolicy,
     };
-
-    fn cfg_with(tls: &str) -> Config {
-        Config {
-            config_version: 1,
-            relay: RelayConfig {
-                url: "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos".into(),
-                fallbacks: vec![],
-                reconnect_initial_delay_ms: 1000,
-                reconnect_max_delay_ms: 60_000,
-                failover_threshold: 5,
-                failover_cooldown_seconds: 600,
-                tls_extra_ca_file: tls.into(),
-            },
-            redis: RedisConfig {
-                url: "redis://localhost:6379".into(),
-                stream_key: "firehose:events".into(),
-                max_stream_len: 500_000,
-                cleanup_unknown_cursors: false,
-            },
-            filter: FilterConfig {
-                record_types: vec![],
-            },
-            cursor: CursorConfig {
-                save_interval_seconds: 5,
-                on_stale_cursor: StaleCursorPolicy::LiveTip,
-                on_protocol_error: ProtocolErrorPolicy::ReconnectFromLiveTip,
-            },
-            publisher: PublisherConfig {
-                max_event_size_bytes: 1_048_576,
-                on_oversize: OversizePolicy::SkipWithLog,
-            },
-            logging: LoggingConfig {
-                level: "info".into(),
-                format: LogFormat::Json,
-            },
-        }
+    Config {
+        config_version: 1,
+        relay: RelayConfig {
+            url: "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos".into(),
+            fallbacks: vec![],
+            reconnect_initial_delay_ms: 1000,
+            reconnect_max_delay_ms: 60_000,
+            failover_threshold: 5,
+            failover_cooldown_seconds: 600,
+            tls_extra_ca_file: tls.into(),
+        },
+        redis: RedisConfig {
+            url: "redis://localhost:6379".into(),
+            stream_key: "firehose:events".into(),
+            max_stream_len: 500_000,
+            cleanup_unknown_cursors: false,
+        },
+        filter: FilterConfig {
+            record_types: vec![],
+        },
+        cursor: CursorConfig {
+            save_interval_seconds: 5,
+            on_stale_cursor: StaleCursorPolicy::LiveTip,
+            on_protocol_error: ProtocolErrorPolicy::ReconnectFromLiveTip,
+        },
+        publisher: PublisherConfig {
+            max_event_size_bytes: 1_048_576,
+            on_oversize: OversizePolicy::SkipWithLog,
+        },
+        logging: LoggingConfig {
+            level: "info".into(),
+            format: LogFormat::Json,
+        },
     }
+}
 
-    // Empty → accepted.
-    crate::validate_tls_extra_ca(&cfg_with("")).expect("empty value must pass");
-    // Set → rejected with a message that references proto-blue#4 so
-    // the operator finds the upstream context quickly.
-    let err = crate::validate_tls_extra_ca(&cfg_with("/etc/ssl/custom-ca.pem"))
-        .expect_err("non-empty tls_extra_ca_file must be rejected at startup");
+#[test]
+fn load_tls_client_config_empty_field_returns_none() {
+    // Phase 8.7: the common-case deployment has `tls_extra_ca_file = ""`
+    // and should get `None` back — the supervisor then uses
+    // proto-blue-ws's default `TungsteniteConnector`, which dials over
+    // native-tls against system roots. No rustls involvement.
+    let got = crate::load_tls_client_config(&cfg_with_tls(""))
+        .expect("empty field must not fail startup");
+    assert!(
+        got.is_none(),
+        "empty tls_extra_ca_file should produce no client config"
+    );
+}
+
+#[test]
+fn load_tls_client_config_nonexistent_file_fails_at_startup() {
+    // File-doesn't-exist fails fast so the operator sees the misconfig
+    // at boot, not as an unrelated-looking TLS handshake error at
+    // first connect attempt (this was the Phase 8.5 finding 4.2
+    // failure mode — inert config hiding real TLS errors).
+    let bogus = "/definitely/not/a/real/path/extra-ca.pem";
+    let err = crate::load_tls_client_config(&cfg_with_tls(bogus))
+        .expect_err("nonexistent CA file must fail startup");
     let msg = err.to_string();
     assert!(
-        msg.contains("proto-blue#4"),
-        "error message should reference the upstream tracking issue; got: {msg}"
+        msg.contains(bogus),
+        "error must echo the configured path so the operator finds it; got: {msg}"
     );
     assert!(
-        msg.contains("/etc/ssl/custom-ca.pem"),
-        "error should echo the configured path so the operator finds it; got: {msg}"
+        msg.to_lowercase().contains("failed to read"),
+        "error must indicate read failure rather than a generic parse error; got: {msg}"
+    );
+}
+
+#[test]
+fn load_tls_client_config_non_pem_content_rejects_with_clear_error() {
+    // A file that has no `-----BEGIN CERTIFICATE-----` marker at all
+    // produces zero parsed certs; we refuse rather than silently
+    // installing a ClientConfig that only has system roots (which
+    // would defeat the point of setting `tls_extra_ca_file`).
+    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    std::io::Write::write_all(&mut tmp, b"this is not a PEM file\n").expect("write tmp");
+    let path = tmp.path().to_string_lossy().into_owned();
+
+    let err = crate::load_tls_client_config(&cfg_with_tls(&path))
+        .expect_err("non-PEM content must fail startup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no CERTIFICATE"),
+        "error should name the missing-certificate-entries failure mode; got: {msg}"
+    );
+}
+
+#[test]
+fn load_tls_client_config_malformed_pem_fails_at_startup() {
+    // A PEM block whose payload isn't valid base64 makes
+    // `rustls_pemfile::certs` yield an Err. We surface it as a
+    // TlsExtraCaFile error at startup rather than at handshake.
+    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    std::io::Write::write_all(
+        &mut tmp,
+        b"-----BEGIN CERTIFICATE-----\n\
+          not valid base64 data !!! @@@ ### $$$ \n\
+          -----END CERTIFICATE-----\n",
+    )
+    .expect("write tmp");
+    let path = tmp.path().to_string_lossy().into_owned();
+
+    let err = crate::load_tls_client_config(&cfg_with_tls(&path))
+        .expect_err("malformed PEM must fail startup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&path),
+        "error must echo the configured path; got: {msg}"
+    );
+    // Either the pemfile parser or the RootCertStore add step can
+    // surface the failure, depending on what the garbage decodes to —
+    // both are equally valid "don't start up with this file" outcomes.
+    assert!(
+        msg.to_lowercase().contains("parse pem")
+            || msg.to_lowercase().contains("add cert to root store"),
+        "error should name which parse stage failed; got: {msg}"
+    );
+}
+
+#[test]
+fn load_tls_client_config_valid_pem_produces_client_config() {
+    // Happy path: a real self-signed RSA cert parses cleanly and we
+    // get back a ClientConfig. We don't drive a handshake against it
+    // here — exercising TLS against a custom CA needs a mock relay
+    // with a matching server cert, which is deferred to a Phase 11
+    // smoke test per DESIGN.md §3.
+    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    std::io::Write::write_all(&mut tmp, VALID_TEST_CA_PEM.as_bytes()).expect("write tmp");
+    let path = tmp.path().to_string_lossy().into_owned();
+
+    let config = crate::load_tls_client_config(&cfg_with_tls(&path))
+        .expect("valid self-signed CA should load")
+        .expect("valid PEM should produce Some(ClientConfig)");
+
+    // Smoke-assert the config is actually populated — rustls'
+    // public surface on ClientConfig is mostly opaque, but
+    // ALPN should be empty by default (we don't set it),
+    // confirming we got a fresh builder output rather than some
+    // junk value.
+    assert!(
+        config.alpn_protocols.is_empty(),
+        "ClientConfig::builder() should produce no ALPN entries by default"
     );
 }
 
@@ -1062,7 +1177,7 @@ async fn startup_metrics_only_emits_allowlisted_fields_no_credentials() {
         },
     };
 
-    crate::emit_startup_metrics(&cfg, std::path::Path::new("/tmp/test.toml"));
+    crate::emit_startup_metrics(&cfg, std::path::Path::new("/tmp/test.toml"), false);
 
     let records = captured.records.lock().unwrap().clone();
     let startup: Vec<_> = records

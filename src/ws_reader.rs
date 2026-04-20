@@ -39,7 +39,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use proto_blue_ws::{WebSocketKeepAlive, WebSocketKeepAliveOpts};
+use proto_blue_ws::{
+    TungsteniteConnector, WebSocketConnector, WebSocketKeepAlive, WebSocketKeepAliveOpts,
+};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -95,6 +97,14 @@ pub struct WsReaderOptions {
     /// the supervisor rotates to the next relay in the fallback
     /// list.
     pub max_reconnect_attempts: u32,
+
+    /// Phase 8.7: optional custom `rustls::ClientConfig` (system
+    /// roots + any `relay.tls_extra_ca_file` CAs). `None` — the
+    /// common case — uses proto-blue-ws's default `native-tls`
+    /// path against system roots. `Some(...)` routes every connect
+    /// through `TungsteniteConnector::with_rustls_config` so the
+    /// extra CAs take effect at the TLS handshake.
+    pub tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl Default for WsReaderOptions {
@@ -106,7 +116,23 @@ impl Default for WsReaderOptions {
             heartbeat_interval_ms: 10_000,
             per_recv_timeout: Duration::from_secs(60),
             max_reconnect_attempts: 5,
+            tls_config: None,
         }
+    }
+}
+
+/// Build the WebSocket connector once per supervisor lifetime. When
+/// `tls_config` is `Some`, the connector carries that
+/// `rustls::ClientConfig` so every `connect()` routes through
+/// `connect_async_tls_with_config(Connector::Rustls(...))`. With
+/// `None`, we use the default `TungsteniteConnector`, which in turn
+/// uses `tokio_tungstenite::connect_async` — that path is backed by
+/// `native-tls`, not rustls, so the rustls crate never touches a
+/// handshake in the common-case deployment.
+fn build_connector(tls: Option<&Arc<rustls::ClientConfig>>) -> Arc<dyn WebSocketConnector> {
+    match tls {
+        Some(config) => Arc::new(TungsteniteConnector::new().with_rustls_config(config.clone())),
+        None => Arc::new(TungsteniteConnector::new()),
     }
 }
 
@@ -502,6 +528,11 @@ async fn supervisor(
     let inner_max_secs = (cfg.reconnect_max_delay_ms / 1000).max(1);
     let mut backoff = initial_backoff;
 
+    // Built once per supervisor lifetime — clones are cheap
+    // (`Arc<dyn WebSocketConnector>`) and each reconnect hands the
+    // same underlying connector to a fresh `WebSocketKeepAlive`.
+    let connector = build_connector(opts.tls_config.as_ref());
+
     'outer: loop {
         if *shutdown_rx.borrow() {
             break;
@@ -553,6 +584,7 @@ async fn supervisor(
             inner_max_secs,
             &metrics,
             &force_reconnect,
+            connector.clone(),
         )
         .await;
 
@@ -657,6 +689,7 @@ async fn run_one_connection(
     inner_max_secs: u64,
     metrics: &Metrics,
     force_reconnect: &Notify,
+    connector: Arc<dyn WebSocketConnector>,
 ) -> ConnectionOutcome {
     // `connect_url` is `relay_label + ?cursor=N` — both components are
     // userinfo-free (validator rejects userinfo-bearing relay URLs in
@@ -669,7 +702,7 @@ async fn run_one_connection(
         "connecting to relay"
     );
 
-    let mut ws = WebSocketKeepAlive::new(
+    let mut ws = WebSocketKeepAlive::with_connector(
         connect_url,
         WebSocketKeepAliveOpts {
             max_reconnect_seconds: inner_max_secs,
@@ -682,6 +715,13 @@ async fn run_one_connection(
             // the next fallback relay.
             max_reconnect_attempts: Some(opts.max_reconnect_attempts),
         },
+        // Phase 8.7: hand proto-blue-ws our connector so custom
+        // `rustls::ClientConfig` (from `tls_extra_ca_file`) — if any
+        // — is honoured at handshake time. For the common case
+        // (empty `tls_extra_ca_file`), this is a default
+        // `TungsteniteConnector` and TLS goes through native-tls
+        // unchanged.
+        connector,
     );
 
     let connect_res = tokio::select! {
@@ -973,6 +1013,9 @@ mod tests {
             // hit this; small cap to fail fast if something goes
             // sideways.
             max_reconnect_attempts: 3,
+            // Tests run against plaintext ws:// mocks — no rustls
+            // involvement.
+            tls_config: None,
         }
     }
 

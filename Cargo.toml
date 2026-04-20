@@ -42,22 +42,44 @@ clap = { version = "4", features = ["derive"] }
 # Phase 3). Default features include `clock` for `Utc::now()`.
 chrono = "0.4"
 
-# TLS — actual handshake is done by `tokio-tungstenite`'s `native-tls`
-# feature, pulled in transitively through `proto-blue-ws`. We had
-# `rustls` + `rustls-native-certs` here earlier when the plan was
-# rustls-with-system-roots, but proto-blue-ws uses
-# `tokio_tungstenite::connect_async` (no `ClientConfig` hook) so the
-# rustls deps were never wired in. See DESIGN.md §3 "TLS verification"
-# and proto-blue#4 for the upstream feature that would flip this back
-# to rustls.
+# TLS. proto-blue-ws's default `tungstenite` feature uses `native-tls`
+# for the TLS handshake (system trust store: OpenSSL on Linux,
+# SChannel on Windows, Security.framework on macOS). That's the path
+# every connect takes when `relay.tls_extra_ca_file` is empty —
+# zero rustls in the cert-path for the common case.
+#
+# Enabling `rustls-tls` activates an additional code path: when we
+# hand `TungsteniteConnector::with_rustls_config` a caller-built
+# `rustls::ClientConfig`, the connector routes that connection
+# through `connect_async_tls_with_config(Connector::Rustls(...))`
+# instead. Native-tls stays in the build as the no-config default.
+#
+# We opt in so `tls_extra_ca_file` can load additional CA bundles
+# additive to system roots (DESIGN.md §3 "TLS verification"). The
+# rustls stack is ring-only to match proto-blue-ws's transitive pin.
 
 # proto-blue (pinned to commit SHA — see "Working with proto-blue" in README)
 proto-blue-api = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
-proto-blue-ws = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
+proto-blue-ws = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734", features = ["rustls-tls"] }
 proto-blue-lex-cbor = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
 proto-blue-lex-data = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
 proto-blue-repo = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
 proto-blue-syntax = { git = "https://github.com/dollspace-gay/proto-blue", rev = "27fd59a26f322484d29da75ca3588013a4bed734" }
+
+# Rustls client (with ring backend to match proto-blue-ws's transitive
+# pin — feature unification keeps only one provider in the build).
+# We use it to construct a `ClientConfig` with system + custom CA
+# roots and hand the Arc to `TungsteniteConnector::with_rustls_config`.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+# Load the OS trust store so custom CAs are *additive* to system
+# roots, not a replacement. 0.8 returns `CertificateResult { certs,
+# errors }` which lets us surface per-cert load failures without
+# refusing the whole startup.
+rustls-native-certs = "0.8"
+
+# PEM parser for user-supplied CA bundles.
+rustls-pemfile = "2"
 
 # FutureExt::catch_unwind for the spawn_instrumented helper
 # (Phase 8.5 finding 2.1). Already in the tree as a transitive dep
@@ -79,6 +101,9 @@ figment = { version = "0.10", features = ["toml", "env", "test"] }
 # version proto-blue-ws transitively pulls in, so they unify in the lockfile.
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
+
+# Scratch files for TLS-config tests (PEM loader paths).
+tempfile = "3"
 
 # In-memory Redis for tests
 # (we'll figure out the right crate during phase 4 — options: `redis-test`, `mini-redis`, or a Docker harness)
