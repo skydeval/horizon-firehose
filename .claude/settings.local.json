@@ -30,7 +30,16 @@
       "Bash(cmd.exe //c \"cargo --version\")",
       "Bash(cmd.exe //c \"where cargo 2>&1\")",
       "Bash(cmd.exe //c \"dir C:\\\\Users\\\\Chrys\\\\.cargo\\\\bin 2>&1\")",
-      "Bash(cmd.exe //c \"docker version --format '{{.Server.Version}}' 2>&1\")"
+      "Bash(cmd.exe //c \"docker version --format '{{.Server.Version}}' 2>&1\")",
+      "Bash(git restore *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(git ls-remote *)",
+      "Bash(where gh *)",
+      "Bash(curl -sSL https://api.github.com/repos/skydeval/horizon-firehose)",
+      "Bash(curl -sSL \"https://registry.hub.docker.com/v2/repositories/library/rust/tags?page_size=20&name=bookworm\")",
+      "Bash(git check-ignore *)"
     ],
     "deny": [
       "Bash(rm -rf /*)",

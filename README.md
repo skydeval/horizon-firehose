@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/skydeval/horizon-firehose/actions/workflows/ci.yml/badge.svg)](https://github.com/skydeval/horizon-firehose/actions/workflows/ci.yml)
 
+For the story of building this, see [RETROSPECTIVE.md](RETROSPECTIVE.md).
+
 A Rust-based ATProto firehose consumer with CBOR/CAR decoding, per-relay failover, and Redis stream publishing.
 
 **Status:** in active development. See [DESIGN.md](DESIGN.md) for the full specification.
