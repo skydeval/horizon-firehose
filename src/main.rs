@@ -245,8 +245,14 @@ fn build_rustls_config_from_pem(path: &Path) -> Result<rustls::ClientConfig, Err
     }
 
     // Custom roots from PEM, additive to the system store above.
-    let mut reader = std::io::BufReader::new(&pem_bytes[..]);
-    let custom: Vec<_> = rustls_pemfile::certs(&mut reader)
+    // Uses the `PemObject` trait from `rustls-pki-types` (rustls
+    // re-exports it as `rustls::pki_types`). Previously we leaned on
+    // `rustls-pemfile`, but RUSTSEC-2025-0134 flagged that crate as
+    // unmaintained — pki-types is the modern in-rustls-ecosystem
+    // replacement and we already carry it transitively.
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    let custom: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem_bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| Error::TlsExtraCaFile {
             path: path.to_path_buf(),

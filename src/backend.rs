@@ -446,17 +446,17 @@ impl InMemoryBackend {
     /// Consume a failure token if one is pending. Returns `Err` if the
     /// caller should pretend this operation failed.
     fn maybe_inject_failure(state: &mut InMemoryState, op: &str) -> Result<(), BackendError> {
-        if let FailMode::FailNext(n) = state.fail_mode.clone() {
-            if n > 0 {
-                state.fail_mode = if n == 1 {
-                    FailMode::AlwaysOk
-                } else {
-                    FailMode::FailNext(n - 1)
-                };
-                return Err(BackendError::Injected(format!(
-                    "simulated failure for op={op}"
-                )));
-            }
+        if let FailMode::FailNext(n) = state.fail_mode.clone()
+            && n > 0
+        {
+            state.fail_mode = if n == 1 {
+                FailMode::AlwaysOk
+            } else {
+                FailMode::FailNext(n - 1)
+            };
+            return Err(BackendError::Injected(format!(
+                "simulated failure for op={op}"
+            )));
         }
         Ok(())
     }

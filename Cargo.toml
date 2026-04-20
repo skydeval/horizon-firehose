@@ -83,8 +83,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # refusing the whole startup.
 rustls-native-certs = "0.8"
 
-# PEM parser for user-supplied CA bundles.
-rustls-pemfile = "2"
+# PEM parsing for user-supplied CA bundles goes through
+# `rustls::pki_types::pem::PemObject`. We used to pull in
+# `rustls-pemfile` here; it was flagged unmaintained in
+# RUSTSEC-2025-0134 (2025-11-28), so Phase 9 followup swapped it
+# out for the in-rustls-ecosystem replacement. pki-types is
+# already in the tree as a transitive dep of rustls, so this is a
+# direct-dep subtraction with no net addition.
 
 # FutureExt::catch_unwind for the spawn_instrumented helper
 # (Phase 8.5 finding 2.1). Already in the tree as a transitive dep

@@ -74,10 +74,10 @@ fn op_matches_filter(op: &crate::event::Operation, filter: &HashSet<String>) -> 
     // Prefer the record body's `$type` — that's authoritative. If
     // there's no record (delete op, or a malformed create), fall back
     // to the path's collection prefix.
-    if let Some(record) = &op.record {
-        if let Some(t) = record.get("$type").and_then(|v| v.as_str()) {
-            return filter.contains(t);
-        }
+    if let Some(record) = &op.record
+        && let Some(t) = record.get("$type").and_then(|v| v.as_str())
+    {
+        return filter.contains(t);
     }
     // Path format: `{collection}/{rkey}`. We never see delete ops
     // without a `/`, but `split_once` guards us anyway.

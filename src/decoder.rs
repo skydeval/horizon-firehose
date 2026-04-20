@@ -1171,10 +1171,10 @@ mod tests {
 
                         if let Event::Commit(c) = ev {
                             for op in &c.ops {
-                                if let Some(rec) = &op.record {
-                                    if let Some(t) = rec.get("$type").and_then(|v| v.as_str()) {
-                                        *record_types.entry(t.into()).or_insert(0) += 1;
-                                    }
+                                if let Some(rec) = &op.record
+                                    && let Some(t) = rec.get("$type").and_then(|v| v.as_str())
+                                {
+                                    *record_types.entry(t.into()).or_insert(0) += 1;
                                 }
                             }
                         }
@@ -1303,10 +1303,10 @@ mod tests {
                     } = &frame
                     {
                         for op in &c.ops {
-                            if let Some(rec) = &op.record {
-                                if let Some(t) = rec.get("$type").and_then(|v| v.as_str()) {
-                                    *record_types.entry(t.into()).or_insert(0) += 1;
-                                }
+                            if let Some(rec) = &op.record
+                                && let Some(t) = rec.get("$type").and_then(|v| v.as_str())
+                            {
+                                *record_types.entry(t.into()).or_insert(0) += 1;
                             }
                         }
                     }

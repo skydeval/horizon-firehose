@@ -198,10 +198,10 @@ async fn capture_loop(
     tokio::pin!(ctrl_c);
 
     loop {
-        if let Some(c) = args.count {
-            if manifest.frame_count >= c {
-                return Ok("count_limit");
-            }
+        if let Some(c) = args.count
+            && manifest.frame_count >= c
+        {
+            return Ok("count_limit");
         }
 
         let recv = ws.recv();
@@ -266,7 +266,7 @@ async fn capture_loop(
         });
         manifest.frame_count += 1;
 
-        if manifest.frame_count % args.progress_interval == 0 {
+        if manifest.frame_count.is_multiple_of(args.progress_interval) {
             let elapsed = start_instant.elapsed();
             let rate = manifest.frame_count as f64 / elapsed.as_secs_f64().max(1e-6);
             info!(
@@ -277,10 +277,12 @@ async fn capture_loop(
             );
         }
 
-        if manifest.frame_count % args.manifest_flush_interval == 0 {
-            if let Err(e) = write_manifest(manifest_path, manifest) {
-                warn!(error = %e, "manifest flush failed; will retry on next interval");
-            }
+        if manifest
+            .frame_count
+            .is_multiple_of(args.manifest_flush_interval)
+            && let Err(e) = write_manifest(manifest_path, manifest)
+        {
+            warn!(error = %e, "manifest flush failed; will retry on next interval");
         }
     }
 }
