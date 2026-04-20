@@ -2,7 +2,12 @@
 name = "horizon-firehose"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# MSRV: proto-blue (0.2.5, c8acc1ba) uses stabilised-in-1.88 `let`
+# chains in `proto-blue-lexicon/src/validation.rs`. Building with
+# anything older produces E0658 ("`let` expressions in this position
+# are unstable") on the proto-blue crates. If we ever vendor or fork
+# proto-blue to support an older MSRV, this bound can come back down.
+rust-version = "1.88"
 authors = ["Chrysanthemum Heart <chrys@chrysanthemum.dev>"]
 description = "A Rust-based ATProto firehose consumer with CBOR/CAR decoding, per-relay failover, and Redis stream publishing"
 license = "MIT OR Apache-2.0"

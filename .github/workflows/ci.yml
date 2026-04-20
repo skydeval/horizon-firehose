@@ -98,6 +98,17 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    # GitHub has tightened the default GITHUB_TOKEN scope so that a
+    # push-triggered workflow gets `contents: read` and little else.
+    # `rustsec/audit-check` posts its findings as a Check Run (needs
+    # `checks: write`) and, when an advisory has no prior tracking
+    # issue, can open one (`issues: write`). Without these the action
+    # hard-fails even when there are no actual vulnerabilities —
+    # which is exactly what happened on Phase 8.7's CI run.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       # Pinned to the exact version the upstream README recommends,
@@ -119,6 +130,15 @@ jobs:
   docker-build:
     name: docker build + smoke
     runs-on: ubuntu-latest
+    # `docker/build-push-action@v5` with `cache-to: type=gha` writes
+    # to the GitHub Actions cache service, which requires
+    # `actions: write` on the job's token. Default push-triggered
+    # workflows no longer grant that implicitly. Without it the
+    # action still runs but cache writes silently no-op, making
+    # every CI build a cold build.
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v4
 

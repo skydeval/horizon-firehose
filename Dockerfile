@@ -3,10 +3,15 @@
 # horizon-firehose — Rust ATProto firehose consumer.
 #
 # Two-stage build:
-#   1. `builder` — `rust:1.85-bookworm` (matches Cargo.toml's rust-version
-#      pin; Debian 12 glibc is ABI-compatible with the distroless runtime).
-#      Produces a release binary with LTO + strip (profile.release in
-#      Cargo.toml already sets those).
+#   1. `builder` — `rust:1.95-bookworm`. Matches our dev toolchain so
+#      the image compiles whatever the tree actually uses rather than
+#      whatever the manifest's MSRV claim allows. (Cargo.toml claims
+#      1.88 — proto-blue's effective minimum for let-chains — but we
+#      develop on 1.95; pinning the image at the lower MSRV would
+#      work today but drifts from dev and risks silently reintroducing
+#      feature gates.) Debian 12 glibc is ABI-compatible with the
+#      distroless runtime. Produces a release binary with LTO + strip
+#      (profile.release in Cargo.toml already sets those).
 #   2. `runtime` — `gcr.io/distroless/cc-debian12:nonroot`. Ships glibc
 #      + libssl3 (needed for native-tls, the default TLS path) and a
 #      baked-in UID 65532 `nonroot` user. No shell, no package manager,
@@ -31,7 +36,7 @@
 # full budget.
 
 # ─── Stage 1: builder ────────────────────────────────────────────────
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.95-bookworm AS builder
 
 # native-tls (the default TLS path) links against libssl/libcrypto and
 # needs headers + pkg-config at build time. Everything else the
