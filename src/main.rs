@@ -147,7 +147,7 @@ fn print_help() {
              horizon-firehose [--version | --help]\n\
          \n\
          The binary takes no positional arguments. Configuration is loaded\n\
-         from ./config.toml by default; override with the HORIZON_FIREHOSE_CONFIG\n\
+         from ./config.toml by default; override with the HF_CONFIG_PATH\n\
          environment variable. Individual fields can be overridden with\n\
          HORIZON_FIREHOSE_* env vars — see config.example.toml for the full\n\
          schema.\n\
@@ -157,6 +157,20 @@ fn print_help() {
 }
 
 fn run() -> Result<(), Error> {
+    // Phase 10.5 finding 1.2 (preventative): install the ring crypto
+    // provider as rustls' process-wide default before any
+    // `ClientConfig::builder()` call. Today rustls's `ring` feature
+    // unification means `builder()` picks ring automatically, so this
+    // is a no-op. The risk it heads off: a future transitive dep
+    // could pull in `rustls/aws-lc-rs`, breaking feature-unification
+    // uniqueness → `builder()` panics with "no crypto provider
+    // installed" on the first TLS config build. Installing explicitly
+    // turns that latent panic into either "install succeeds" (we
+    // continue) or "install fails because one is already installed"
+    // (we continue too; `.ok()` swallows the Err). Either way startup
+    // proceeds deterministically.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let path = Config::resolve_path();
     let cfg = Config::load(&path)?;
     let tls_config = load_tls_client_config(&cfg)?;
@@ -233,15 +247,44 @@ fn build_rustls_config_from_pem(path: &Path) -> Result<rustls::ClientConfig, Err
     // trust store shouldn't refuse startup (some system stores carry
     // pre-expired or malformed intermediates) — log and proceed with
     // whatever loaded successfully.
+    //
+    // Phase 10.5 finding 1.3: we used to `let _ = roots.add(cert)`
+    // for every cert and call it done. If every single one failed
+    // (empty store, all malformed, all expired), the resulting
+    // ClientConfig would trust ONLY the custom PEM — silently
+    // turning an intended "system + extras" config into a
+    // "private-CA only" config. That's a dangerous default for a
+    // consumer talking to public relays: a compromised or misissued
+    // private CA is suddenly enough to MITM everything. Track
+    // success count explicitly and refuse startup if nothing loaded.
     let native = rustls_native_certs::load_native_certs();
-    if !native.errors.is_empty() {
+    let native_error_count = native.errors.len();
+    if native_error_count > 0 {
         warn!(
-            error_count = native.errors.len(),
+            error_count = native_error_count,
             "some OS trust-store certs failed to load; continuing with the subset that loaded"
         );
     }
+    let native_attempted = native.certs.len();
+    let mut native_added = 0usize;
     for cert in native.certs {
-        let _ = roots.add(cert);
+        if roots.add(cert).is_ok() {
+            native_added += 1;
+        }
+    }
+    if native_added == 0 {
+        return Err(Error::TlsExtraCaFile {
+            path: path.to_path_buf(),
+            reason: format!(
+                "zero system trust-store roots loaded successfully \
+                 (attempted={native_attempted}, load_native_certs errors={native_error_count}). \
+                 Refusing to build a ClientConfig that would trust only the custom PEM — \
+                 that would silently downgrade the TLS posture to \"private-CA only\", \
+                 where any misissuance in {path:?} becomes enough to MITM public relays. \
+                 Fix the OS trust store, or if you genuinely want private-CA-only mode, \
+                 that's a separate feature — not the default \"additive\" semantics."
+            ),
+        });
     }
 
     // Custom roots from PEM, additive to the system store above.
@@ -277,6 +320,7 @@ fn build_rustls_config_from_pem(path: &Path) -> Result<rustls::ClientConfig, Err
         event_type = "tls_extra_ca_loaded",
         path = %path.display(),
         custom_cert_count = custom_count,
+        native_cert_count = native_added,
         "loaded tls_extra_ca_file additive to system roots"
     );
 
@@ -540,7 +584,24 @@ async fn run_async(
     let ws_state = ws_reader.state_reader();
     let ws_control = ws_reader.control();
 
-    let mut decoder_handle = decoder::spawn(ws_reader, event_tx, metrics.clone(), ws_control);
+    // Phase 10.5 finding 5.1: the decoder consults
+    // `cursor.on_stale_cursor` and `cursor.on_protocol_error`. When
+    // a policy of `Exit` fires, the decoder pushes a reason onto
+    // this channel and flips the global shutdown. We observe the
+    // channel *after* the shutdown cascade so the process exits
+    // non-zero with clear attribution, instead of the misleading
+    // "decoder exited unexpectedly" the coordinator would otherwise log.
+    let (policy_exit_tx, mut policy_exit_rx) = mpsc::unbounded_channel::<decoder::PolicyExit>();
+
+    let mut decoder_handle = decoder::spawn(
+        ws_reader,
+        event_tx,
+        metrics.clone(),
+        ws_control,
+        decoder::DecoderPolicies::from_cursor_config(&cfg.cursor),
+        shutdown_tx.clone(),
+        policy_exit_tx,
+    );
 
     let mut router_handle = router::spawn(
         router::RouterOptions {
@@ -708,6 +769,19 @@ async fn run_async(
         final_cursor_per_relay = %serde_json::to_string(&final_cursor_per_relay).unwrap_or_default(),
         "shutdown complete"
     );
+
+    // Phase 10.5 finding 5.1: policy-driven exits surface here after
+    // the cascade has drained everything. Takes precedence over the
+    // task-fault branch because an operator-configured
+    // `on_stale_cursor=exit` IS a clean shutdown (not a bug) —
+    // we just need the process to come out non-zero so the
+    // orchestrator sees the operator's intent.
+    if let Ok(policy_exit) = policy_exit_rx.try_recv() {
+        return Err(Error::TaskFailure {
+            task: "decoder",
+            message: format!("policy-driven exit: {}", policy_exit.reason),
+        });
+    }
 
     // A task fault → non-zero exit so the orchestrator restarts us.
     if let Some(task) = fault {

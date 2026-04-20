@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use proto_blue_ws::{
     TungsteniteConnector, WebSocketConnector, WebSocketKeepAlive, WebSocketKeepAliveOpts,
 };
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -76,10 +76,17 @@ pub struct WsReaderOptions {
     /// its failure counter is reset to zero (§3 "60s clean operation").
     pub clean_window: Duration,
 
-    /// How many frames must arrive within `clean_window` before reset
-    /// (§3 "≥10 events successfully published"). Phase 2 counts
-    /// frames-from-WS as a proxy until the publisher exists.
-    pub clean_frames: u64,
+    /// How many *events* must have been successfully XADDed since
+    /// `connected_at` before the relay's failure counter resets
+    /// (§3 "≥10 events successfully published"). Read off
+    /// `Metrics::events_total` as a delta from the value at connect
+    /// time, not `frames_since` — a WebSocket-connected-but-garbage
+    /// relay can emit unlimited frames while the publisher never
+    /// advances, and the old frames-proxy would mistakenly reset the
+    /// failure counter in that state. Phase 10.5 finding 3.1 (the
+    /// Phase-2 tombstone is retired now that we have real
+    /// publisher-side metrics).
+    pub clean_events: u64,
 
     /// Heartbeat interval handed to proto-blue-ws.
     pub heartbeat_interval_ms: u64,
@@ -112,7 +119,7 @@ impl Default for WsReaderOptions {
         Self {
             frame_buffer: 1024,
             clean_window: Duration::from_secs(60),
-            clean_frames: 10,
+            clean_events: 10,
             heartbeat_interval_ms: 10_000,
             per_recv_timeout: Duration::from_secs(60),
             max_reconnect_attempts: 5,
@@ -323,9 +330,16 @@ pub struct WsReader {
     /// preventing channel close during shutdown (`mpsc::WeakSender`
     /// doesn't count toward keep-alive).
     frames_weak: mpsc::WeakSender<Frame>,
-    /// Shared `Notify` so the decoder's circuit breaker can ask us
-    /// to drop the current connection. See [`WsReaderControl`].
-    force_reconnect: Arc<Notify>,
+    /// Circuit-breaker trip counter. Phase 10.5 finding 1.1 replaced
+    /// the earlier `Arc<Notify>` here: `notify_waiters()` only wakes
+    /// tasks *currently* awaiting `notified()`, so trips fired
+    /// during supervisor windows where no one was listening (connect,
+    /// backoff sleep, frames_tx.send) were silently dropped. A
+    /// `watch::Sender<u64>` latches: every `trigger_force_reconnect`
+    /// bumps the counter, and `watch::Receiver::changed()` on the
+    /// supervisor's end observes every distinct increment — including
+    /// ones that landed before a particular `changed()` call started.
+    force_reconnect_tx: watch::Sender<u64>,
 }
 
 /// Cloneable accessor for ws_reader's supervisor state. Produced by
@@ -374,18 +388,29 @@ impl WsStateReader {
 /// get a trigger.
 #[derive(Clone)]
 pub struct WsReaderControl {
-    force_reconnect: Arc<Notify>,
+    force_reconnect_tx: watch::Sender<u64>,
 }
 
 impl WsReaderControl {
     /// Ask the supervisor to abort the current connection and re-run
-    /// relay selection. The supervisor observes this in its inner
-    /// `select!` and treats it as if the connection dropped — the
-    /// failing relay's failure counter increments as normal, so
-    /// repeated forced reconnects will push it into cooldown and
-    /// promote a fallback.
+    /// relay selection. Bumps a monotonic counter on a
+    /// `watch::Sender<u64>`; the supervisor's corresponding
+    /// `watch::Receiver<u64>` observes the change through its
+    /// `changed()` method from inside every `select!` arm it runs
+    /// (connect, recv, backoff sleep, send).
+    ///
+    /// The old implementation used `Arc<Notify>::notify_waiters()`,
+    /// which only wakes tasks currently parked on `notified()`. Phase
+    /// 10.5 finding 1.1 showed trips were getting silently dropped
+    /// whenever the supervisor was in any other `select!` arm — e.g.
+    /// during `WebSocketKeepAlive::connect()` or while blocked
+    /// sending a frame downstream with a slow consumer. The watch
+    /// channel latches: the receiver always observes the next
+    /// distinct value, even if the bump happened before
+    /// `changed()` was called.
     pub fn trigger_force_reconnect(&self) {
-        self.force_reconnect.notify_waiters();
+        self.force_reconnect_tx
+            .send_modify(|v| *v = v.saturating_add(1));
     }
 }
 
@@ -421,10 +446,11 @@ impl WsReader {
     }
 
     /// Control handle that can trigger a forced reconnect. Used by
-    /// the decoder's circuit breaker (Phase 8.5 review finding 3.4).
+    /// the decoder's circuit breaker (Phase 8.5 review finding 3.4,
+    /// migrated to latching semantics in Phase 10.5 finding 1.1).
     pub fn control(&self) -> WsReaderControl {
         WsReaderControl {
-            force_reconnect: self.force_reconnect.clone(),
+            force_reconnect_tx: self.force_reconnect_tx.clone(),
         }
     }
 
@@ -487,7 +513,16 @@ fn spawn_internal(
     let (frames_tx, frames_rx) = mpsc::channel(opts.frame_buffer);
     let frames_weak = frames_tx.downgrade();
     let state = Arc::new(Mutex::new(SharedState::from_config(&cfg)));
-    let force_reconnect = Arc::new(Notify::new());
+    // Phase 10.5 finding 1.1: `watch::channel(0u64)` starts the
+    // circuit-breaker counter at 0; each decoder trip bumps the value
+    // and supervisor's `changed()` fires on the next observation.
+    // We hand the supervisor the receiver derived via `.subscribe()`
+    // immediately — if instead we stored the initial Receiver and
+    // later called `.subscribe()` again, the supervisor's starting
+    // "last seen" value would be the *current* counter at subscribe
+    // time, and a trip that landed between that moment and the first
+    // `changed()` call would be missed.
+    let (force_reconnect_tx, force_reconnect_rx) = watch::channel(0u64);
     let task = crate::spawn_instrumented(
         "ws_reader_supervisor",
         supervisor(
@@ -498,7 +533,7 @@ fn spawn_internal(
             state.clone(),
             cursors,
             metrics,
-            force_reconnect.clone(),
+            force_reconnect_rx,
         ),
     );
     WsReader {
@@ -507,7 +542,7 @@ fn spawn_internal(
         shutdown_tx,
         state,
         frames_weak,
-        force_reconnect,
+        force_reconnect_tx,
     }
 }
 
@@ -520,7 +555,7 @@ async fn supervisor(
     state: Arc<Mutex<SharedState>>,
     cursors: Cursors,
     metrics: Arc<Metrics>,
-    force_reconnect: Arc<Notify>,
+    mut force_reconnect_rx: watch::Receiver<u64>,
 ) {
     let initial_backoff = Duration::from_millis(cfg.reconnect_initial_delay_ms);
     let max_backoff = Duration::from_millis(cfg.reconnect_max_delay_ms);
@@ -583,7 +618,7 @@ async fn supervisor(
             &mut shutdown_rx,
             inner_max_secs,
             &metrics,
-            &force_reconnect,
+            &mut force_reconnect_rx,
             connector.clone(),
         )
         .await;
@@ -638,6 +673,19 @@ async fn supervisor(
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = shutdown_rx.changed() => break 'outer,
+                    // Phase 10.5 finding 1.1: observe circuit trips
+                    // that land DURING the backoff sleep, too. Under
+                    // the old `Arc<Notify>` these were silently lost.
+                    // Now the next `run_one_connection` starts
+                    // sooner, skipping whatever's left of the backoff
+                    // — we treat a trip as an operator-level "drop
+                    // this relay immediately" signal.
+                    _ = force_reconnect_rx.changed() => {
+                        info!(
+                            relay = %url,
+                            "circuit trip observed during backoff; shortening sleep"
+                        );
+                    }
                 }
                 backoff = backoff.saturating_mul(2).min(max_backoff);
                 continue;
@@ -688,7 +736,7 @@ async fn run_one_connection(
     shutdown_rx: &mut watch::Receiver<bool>,
     inner_max_secs: u64,
     metrics: &Metrics,
-    force_reconnect: &Notify,
+    force_reconnect_rx: &mut watch::Receiver<u64>,
     connector: Arc<dyn WebSocketConnector>,
 ) -> ConnectionOutcome {
     // `connect_url` is `relay_label + ?cursor=N` — both components are
@@ -727,6 +775,20 @@ async fn run_one_connection(
     let connect_res = tokio::select! {
         biased;
         _ = shutdown_rx.changed() => return ConnectionOutcome::Shutdown,
+        // Phase 10.5 finding 1.1: observe circuit trips DURING
+        // connect. Previously a decoder-triggered trip here was
+        // silently lost — `Arc<Notify>` only wakes waiters on
+        // `notified()`, which was never called in the connect
+        // window. The watch channel latches, so the next
+        // `changed()` call always picks up any bump that happened
+        // since the last observation.
+        _ = force_reconnect_rx.changed() => {
+            info!(
+                relay = %relay_label,
+                "circuit trip observed during connect; aborting dial"
+            );
+            return ConnectionOutcome::ForcedReconnect;
+        }
         r = ws.connect() => r,
     };
     if let Err(e) = connect_res {
@@ -757,7 +819,15 @@ async fn run_one_connection(
     );
 
     let connected_at = Instant::now();
-    let mut frames_since: u64 = 0;
+    // Phase 10.5 finding 3.1: take a baseline of published events so
+    // the clean-op reset checks the publisher's progress, not the
+    // WebSocket's. A "relay is connected and emitting frames but
+    // every decode fails" state would previously have passed the
+    // frames-proxy threshold and reset the failure counter — now it
+    // doesn't.
+    let events_at_connect = metrics
+        .events_total
+        .load(std::sync::atomic::Ordering::Relaxed);
     let mut failures_reset = false;
 
     loop {
@@ -770,7 +840,7 @@ async fn run_one_connection(
         let result = tokio::select! {
             biased;
             _ = shutdown_rx.changed() => return ConnectionOutcome::Shutdown,
-            _ = force_reconnect.notified() => {
+            _ = force_reconnect_rx.changed() => {
                 info!(
                     relay = %relay_label,
                     "forced reconnect requested by downstream (decoder circuit breaker)"
@@ -802,25 +872,42 @@ async fn run_one_connection(
             }
         };
 
-        frames_since += 1;
-        if !failures_reset
-            && frames_since >= opts.clean_frames
-            && connected_at.elapsed() >= opts.clean_window
-        {
-            let mut s = state.lock().unwrap();
-            if s.relays[idx].consecutive_failures > 0 {
-                debug!(
-                    relay = %s.relays[idx].url,
-                    "resetting failure counter after clean operation"
-                );
+        if !failures_reset && connected_at.elapsed() >= opts.clean_window {
+            let events_now = metrics
+                .events_total
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let events_delta = events_now.saturating_sub(events_at_connect);
+            if events_delta >= opts.clean_events {
+                let mut s = state.lock().unwrap();
+                if s.relays[idx].consecutive_failures > 0 {
+                    debug!(
+                        relay = %s.relays[idx].url,
+                        events_delta,
+                        "resetting failure counter after clean operation"
+                    );
+                }
+                s.reset_failures(idx);
+                failures_reset = true;
             }
-            s.reset_failures(idx);
-            failures_reset = true;
         }
 
         let send_res = tokio::select! {
             biased;
             _ = shutdown_rx.changed() => return ConnectionOutcome::Shutdown,
+            // Phase 10.5 finding 1.1: observe circuit trips while
+            // we're blocked pushing to a slow downstream consumer
+            // too. The decoder itself owns `frames_rx`, so in practice
+            // it won't be *both* asking us to reconnect *and*
+            // refusing to consume frames — but a router-deep
+            // bottleneck could stall the frames_tx.send and lose a
+            // trip from another path. Latching receiver fixes it.
+            _ = force_reconnect_rx.changed() => {
+                info!(
+                    relay = %relay_label,
+                    "circuit trip observed while sending to decoder; aborting current connection"
+                );
+                return ConnectionOutcome::ForcedReconnect;
+            }
             r = frames_tx.send((data, relay_label.to_string())) => r,
         };
         if send_res.is_err() {
@@ -997,11 +1084,34 @@ mod tests {
 
     // ─── end-to-end tests with mock WebSocket servers ──────────────────
 
+    /// Test-only spawn that also hands the `Arc<Metrics>` back to the
+    /// caller. `spawn()` bakes its own metrics handle in, but Phase
+    /// 10.5 finding 3.1 makes the supervisor's clean-op reset
+    /// depend on `events_total` increments coming from a real
+    /// publisher downstream. Tests don't run the publisher, so they
+    /// need to poke `events_total` manually to simulate XADD success.
+    fn spawn_with_owned_metrics(
+        cfg: RelayConfig,
+        opts: WsReaderOptions,
+    ) -> (WsReader, Arc<Metrics>) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let metrics = Arc::new(Metrics::default());
+        let reader = spawn_internal(
+            cfg,
+            opts,
+            Cursors::new(),
+            shutdown_rx,
+            Some(shutdown_tx),
+            metrics.clone(),
+        );
+        (reader, metrics)
+    }
+
     fn test_options() -> WsReaderOptions {
         WsReaderOptions {
             frame_buffer: 16,
             clean_window: Duration::from_millis(100),
-            clean_frames: 2,
+            clean_events: 2,
             heartbeat_interval_ms: 60_000,
             // Long enough that no test trips it accidentally — the
             // SDK bounds silence internally via `per_recv_timeout_ms`
@@ -1279,6 +1389,12 @@ mod tests {
     async fn resets_failure_counter_after_clean_operation_window() {
         // One disconnect to bump consecutive_failures, then a stable
         // stream that should reset it.
+        //
+        // Phase 10.5 finding 3.1: reset now depends on `events_total`
+        // (publisher progress) rather than `frames_since` (WS
+        // progress). Tests don't run a publisher, so we tick
+        // `events_total` manually on each recv to simulate XADD
+        // success.
         let server = start_mock(vec![
             Behavior::CloseImmediately,
             Behavior::StreamForever {
@@ -1290,15 +1406,23 @@ mod tests {
         let cfg = relay_cfg(&server.url, &[]);
         let opts = WsReaderOptions {
             clean_window: Duration::from_millis(100),
-            clean_frames: 2,
+            clean_events: 2,
             ..test_options()
         };
-        let mut reader = spawn(cfg, opts);
+        let (mut reader, metrics) = spawn_with_owned_metrics(cfg, opts);
 
-        // Drain frames while the clean window elapses.
+        // Drain frames while the clean window elapses. Tick events_total
+        // on each successful recv so the supervisor sees the publisher
+        // making progress.
         let deadline = Instant::now() + Duration::from_millis(400);
         while Instant::now() < deadline {
-            let _ = tokio::time::timeout(Duration::from_millis(50), reader.recv()).await;
+            if let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(50), reader.recv()).await
+            {
+                metrics
+                    .events_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         let states = reader.relay_states();
@@ -1307,6 +1431,48 @@ mod tests {
             "failure counter should have been reset after clean operation"
         );
         assert!(states[0].cooldown_until.is_none());
+
+        reader.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn does_not_reset_failure_counter_when_publisher_stalled() {
+        // Phase 10.5 finding 3.1: the NEW behaviour. Frames keep
+        // flowing for well past clean_window + clean_events count,
+        // but `events_total` never ticks — simulating a
+        // "WebSocket-healthy but decode/publish path jammed"
+        // condition. Previously this would have reset the counter
+        // (frames_since was the proxy); it must NOT now.
+        let server = start_mock(vec![
+            Behavior::CloseImmediately,
+            Behavior::StreamForever {
+                interval: Duration::from_millis(5),
+                payload: b"x".to_vec(),
+            },
+        ])
+        .await;
+        let cfg = relay_cfg(&server.url, &[]);
+        let opts = WsReaderOptions {
+            clean_window: Duration::from_millis(100),
+            clean_events: 2,
+            ..test_options()
+        };
+        // Share the reader's own internal Metrics — we intentionally
+        // don't tick events_total here, even though frames arrive.
+        let (mut reader, _metrics) = spawn_with_owned_metrics(cfg, opts);
+
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < deadline {
+            let _ = tokio::time::timeout(Duration::from_millis(50), reader.recv()).await;
+        }
+
+        let states = reader.relay_states();
+        assert!(
+            states[0].consecutive_failures >= 1,
+            "failure counter must stay set when the publisher hasn't progressed; got {}",
+            states[0].consecutive_failures
+        );
 
         reader.shutdown().await;
         server.shutdown().await;
@@ -1405,6 +1571,77 @@ mod tests {
         assert_eq!(states[1].url, fallback_url);
 
         reader.shutdown().await;
+        fallback.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn circuit_trips_during_connect_drive_primary_to_cooldown_and_promote_fallback() {
+        // Phase 10.5 finding 1.1 + finding 2.9: the end-to-end proof
+        // that circuit trips are observed regardless of which
+        // `select!` arm the supervisor is in.
+        //
+        // Strategy: simulate a decoder that repeatedly trips the
+        // circuit while the supervisor is trying to connect to the
+        // primary. Under the old `Arc<Notify>` semantics, trips
+        // fired during `WebSocketKeepAlive::connect()` were lost
+        // (no task was awaiting `notified()`). With the latching
+        // `watch::Sender<u64>` they surface at the next `changed()`
+        // call in the connect-arm `select!`, so each trip counts as
+        // a failure against the primary and — after
+        // `failover_threshold` trips — pushes it into cooldown.
+        //
+        // Primary accepts and holds the connection open (no frames)
+        // so trips fire while the supervisor is in the recv /
+        // connect windows, not right after a clean disconnect.
+        // Fallback sends a distinctive frame so the test can
+        // confirm the supervisor actually rotated.
+        let primary = start_mock(vec![Behavior::SendThenHold(vec![])]).await;
+        let fallback = start_mock(vec![Behavior::SendThenHold(vec![
+            b"from-fallback".to_vec(),
+        ])])
+        .await;
+
+        let cfg = relay_cfg(&primary.url, &[fallback.url.as_str()]);
+        let reader = spawn(cfg, test_options());
+        let control = reader.control();
+
+        let primary_url = primary.url.clone();
+        let fallback_url = fallback.url.clone();
+
+        // `failover_threshold` in `test_options()` is 2 (from
+        // `relay_cfg`). Bump it a few extra times past the threshold
+        // — the cooldown branch fires on any trip at or past
+        // threshold, and the extra trips also exercise the "still
+        // fires during backoff sleep" path.
+        for _ in 0..5 {
+            control.trigger_force_reconnect();
+            tokio::time::sleep(Duration::from_millis(75)).await;
+        }
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), {
+            let mut reader = reader;
+            async move {
+                let f = reader.recv().await;
+                (f, reader)
+            }
+        })
+        .await
+        .expect("fallback frame should arrive after primary is cooled down");
+        let (frame_opt, reader) = frame;
+        let frame = frame_opt.expect("channel closed before fallback frame");
+        assert_eq!(frame.0, b"from-fallback");
+        assert_eq!(frame.1, fallback_url);
+
+        let states = reader.relay_states();
+        assert_eq!(states[0].url, primary_url);
+        assert!(
+            states[0].cooldown_until.is_some(),
+            "primary should be in cooldown after repeated circuit trips — got {states:?}"
+        );
+        assert_eq!(states[1].url, fallback_url);
+
+        reader.shutdown().await;
+        primary.shutdown().await;
         fallback.shutdown().await;
     }
 }

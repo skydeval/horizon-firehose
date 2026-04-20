@@ -29,16 +29,98 @@ use proto_blue_lex_cbor::{CborError, decode, decode_all};
 use proto_blue_lex_data::{Cid, LexValue};
 use proto_blue_repo::read_car;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::config::{ProtocolErrorPolicy, StaleCursorPolicy};
 use crate::event::{
     AccountEvent, CommitEvent, Event, HandleEvent, IdentityEvent, Operation, TombstoneEvent,
 };
 use crate::metrics::Metrics;
 use crate::publisher::PublishOp;
 use crate::ws_reader::{WsReader, WsReaderControl};
+
+/// Phase 10.5 finding 5.1: policy knobs the decoder consults when
+/// protocol-level signal frames arrive. Parsed into this struct once
+/// at startup so the decoder task has everything it needs without
+/// reaching back into the `Config`.
+#[derive(Debug, Clone, Copy)]
+pub struct DecoderPolicies {
+    pub on_stale_cursor: StaleCursorPolicy,
+    pub on_protocol_error: ProtocolErrorPolicy,
+}
+
+impl DecoderPolicies {
+    /// Map from the user-facing `[cursor]` config section.
+    pub fn from_cursor_config(cfg: &crate::config::CursorConfig) -> Self {
+        Self {
+            on_stale_cursor: cfg.on_stale_cursor,
+            on_protocol_error: cfg.on_protocol_error,
+        }
+    }
+
+    /// Decide what the decoder should do on an `OutdatedCursor`
+    /// frame. Extracted into its own method so unit tests can
+    /// exercise the policy matrix without constructing a whole
+    /// WebSocket pipeline.
+    pub(crate) fn outdated_cursor_action(
+        &self,
+        relay: &str,
+        message: Option<&str>,
+    ) -> PolicyAction {
+        match self.on_stale_cursor {
+            StaleCursorPolicy::LiveTip => PolicyAction::Continue,
+            StaleCursorPolicy::Exit => PolicyAction::Exit(PolicyExit {
+                reason: format!(
+                    "on_stale_cursor=exit after OutdatedCursor from {relay}: message={message:?}"
+                ),
+            }),
+        }
+    }
+
+    /// Same shape as `outdated_cursor_action`, but for non-Outdated
+    /// `#info` / `op=-1` frames that fall under `on_protocol_error`.
+    pub(crate) fn protocol_error_action(
+        &self,
+        relay: &str,
+        name: &str,
+        message: Option<&str>,
+    ) -> PolicyAction {
+        match self.on_protocol_error {
+            ProtocolErrorPolicy::ReconnectFromLiveTip => PolicyAction::Continue,
+            ProtocolErrorPolicy::Exit => PolicyAction::Exit(PolicyExit {
+                reason: format!(
+                    "on_protocol_error=exit after info frame `{name}` from {relay}: \
+                     message={message:?}"
+                ),
+            }),
+        }
+    }
+}
+
+/// What `DecoderPolicies::*_action` returns. `Continue` keeps the
+/// decoder loop running; `Exit` carries the reason string up to the
+/// coordinator so it can surface a non-zero process exit with proper
+/// attribution.
+#[derive(Debug)]
+pub(crate) enum PolicyAction {
+    Continue,
+    Exit(PolicyExit),
+}
+
+/// Phase 10.5 finding 5.1: reason for a clean policy-driven exit
+/// the decoder forwards to the coordinator. Surfaced via a shared
+/// sender so `main` can turn it into a non-zero process exit AFTER
+/// the normal shutdown cascade has run (drain publisher, flush
+/// cursor, etc.). Without this, a policy = Exit configuration would
+/// silently continue running.
+#[derive(Debug, Clone)]
+pub struct PolicyExit {
+    /// Human-readable description (e.g.
+    /// `"on_stale_cursor=exit after OutdatedCursor from wss://…"`).
+    pub reason: String,
+}
 
 /// Top-level result of decoding one binary frame.
 #[derive(Debug)]
@@ -136,6 +218,24 @@ pub enum DecodeError {
     /// as a decode error rather than a decoder panic.
     #[error("malformed CBOR in preflight scan: {0}")]
     MalformedCbor(&'static str),
+
+    /// Phase 10.5 review finding 3.4: the firehose spec is
+    /// "header + body, exactly two top-level CBOR values." Anything
+    /// beyond that would be consumed by `decode_all` (which runs
+    /// until bytes are exhausted) and cause the recursive decoders
+    /// — ciborium, `cbor_to_lex`, `lex_to_json` — to run on the
+    /// extra values without going through the depth preflight
+    /// (which caps its stack at depth-per-outer-value). A hostile
+    /// frame with three or more top-level items could stack-overflow
+    /// via the extras and trip SIGABRT → crashloop (cursor preserved,
+    /// relay replays the same hostile frame on restart). The
+    /// preflight now returns the byte offset it consumed; anything
+    /// after that is rejected here.
+    #[error(
+        "frame has {got_bytes_after} extra byte(s) after the two top-level CBOR values; \
+         firehose frames are `header` + `body` only"
+    )]
+    ExtraTopLevelValues { got_bytes_after: usize },
 }
 
 /// Phase 8.5 review finding 3.2: ATProto firehose spec hard maximum.
@@ -173,7 +273,21 @@ pub fn decode_frame(bytes: &[u8], relay: &str) -> Result<DecodedFrame, DecodeErr
     // length prefixes iteratively without building a tree; rejects
     // deeply-nested frames before any recursive decoder touches
     // them.
-    preflight_scan(bytes, MAX_PREFLIGHT_DEPTH)?;
+    //
+    // Phase 10.5 review finding 3.4: the preflight assumes exactly
+    // two top-level CBOR values (header + body). `decode_all`
+    // downstream runs until bytes are exhausted, so a hostile frame
+    // with three or more top-level items would get all extras
+    // decoded by the recursive path WITHOUT depth protection —
+    // stack overflow territory. We check the returned cursor
+    // position: any leftover bytes after the preflight's two-value
+    // walk is a rejection.
+    let preflight_consumed = preflight_scan(bytes, MAX_PREFLIGHT_DEPTH)?;
+    if preflight_consumed < bytes.len() {
+        return Err(DecodeError::ExtraTopLevelValues {
+            got_bytes_after: bytes.len() - preflight_consumed,
+        });
+    }
 
     let values = decode_all(bytes)?;
     if values.len() < 2 {
@@ -436,7 +550,7 @@ fn lex_to_json_bounded(v: &LexValue, depth: u32) -> Result<serde_json::Value, De
 ///   the primary decoder still runs and surfaces those errors.
 /// - Byte-length truncation at the end of the frame. Same reasoning:
 ///   decode_all sees it, we don't try to double-validate.
-pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeError> {
+pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<usize, DecodeError> {
     // Stack: remaining items at each nesting level, outermost first.
     // The top-level of a firehose frame is two items (header + body).
     let mut stack: Vec<u64> = Vec::with_capacity(16);
@@ -459,7 +573,7 @@ pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeE
             // Ran out of bytes mid-structure. Let `decode_all` in the
             // main path report truncation with its own error; the
             // preflight's job is depth enforcement, not completeness.
-            return Ok(());
+            return Ok(pos);
         }
 
         // Reject depth beyond the cap *before* opening a new container.
@@ -483,7 +597,7 @@ pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeE
             0..=23 => info as u64,
             24 => {
                 if pos >= bytes.len() {
-                    return Ok(());
+                    return Ok(pos);
                 }
                 let v = bytes[pos] as u64;
                 pos += 1;
@@ -491,7 +605,7 @@ pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeE
             }
             25 => {
                 if pos + 2 > bytes.len() {
-                    return Ok(());
+                    return Ok(pos);
                 }
                 let v = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as u64;
                 pos += 2;
@@ -499,7 +613,7 @@ pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeE
             }
             26 => {
                 if pos + 4 > bytes.len() {
-                    return Ok(());
+                    return Ok(pos);
                 }
                 let v = u32::from_be_bytes([
                     bytes[pos],
@@ -512,7 +626,7 @@ pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeE
             }
             27 => {
                 if pos + 8 > bytes.len() {
-                    return Ok(());
+                    return Ok(pos);
                 }
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&bytes[pos..pos + 8]);
@@ -567,7 +681,7 @@ pub(crate) fn preflight_scan(bytes: &[u8], max_depth: u32) -> Result<(), DecodeE
         }
     }
 
-    Ok(())
+    Ok(pos)
 }
 
 fn bytes_hex(b: &[u8]) -> String {
@@ -762,11 +876,15 @@ impl DecoderHandle {
 /// `DECODER_CIRCUIT_THRESHOLD` consecutive failures the decoder
 /// signals `ws_reader` to force a failover (finding 3.4); the
 /// counter resets on the next successful decode.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     mut reader: WsReader,
     event_tx: mpsc::Sender<PublishOp>,
     metrics: Arc<Metrics>,
     control: WsReaderControl,
+    policies: DecoderPolicies,
+    shutdown_tx: watch::Sender<bool>,
+    policy_exit_tx: mpsc::UnboundedSender<PolicyExit>,
 ) -> DecoderHandle {
     let task = crate::spawn_instrumented("decoder", async move {
         let mut stats = DecoderStats::default();
@@ -874,20 +992,73 @@ pub fn spawn(
                 }
                 DecodedFrame::OutdatedCursor { message } => {
                     stats.outdated_cursors += 1;
-                    warn!(
-                        relay = %relay,
-                        message = ?message,
-                        "received OutdatedCursor from relay (policy handling is phase-next)",
-                    );
+                    // Phase 10.5 finding 5.1: consult
+                    // `cursor.on_stale_cursor`. LiveTip (the default)
+                    // logs and continues — ws_reader's next reconnect
+                    // without a `?cursor=` resume param lands us at
+                    // live tip. Exit ships the reason to the
+                    // coordinator via `policy_exit_tx` and flips the
+                    // global shutdown so the cascade drains cleanly.
+                    match policies.outdated_cursor_action(&relay, message.as_deref()) {
+                        PolicyAction::Continue => {
+                            warn!(
+                                target: "horizon_firehose::metrics",
+                                event_type = "outdated_cursor",
+                                relay = %relay,
+                                message = ?message,
+                                policy = "live_tip",
+                                "relay rejected cursor as stale; resuming from live tip",
+                            );
+                        }
+                        PolicyAction::Exit(exit) => {
+                            warn!(
+                                target: "horizon_firehose::metrics",
+                                event_type = "policy_exit",
+                                relay = %relay,
+                                message = ?message,
+                                policy = "on_stale_cursor=exit",
+                                reason = %exit.reason,
+                                "operator-configured policy_exit on OutdatedCursor; initiating shutdown",
+                            );
+                            let _ = policy_exit_tx.send(exit);
+                            let _ = shutdown_tx.send(true);
+                            break;
+                        }
+                    }
                 }
                 DecodedFrame::Info { name, message } => {
                     stats.info_frames += 1;
-                    info!(
-                        relay = %relay,
-                        info_name = %name,
-                        message = ?message,
-                        "relay info frame"
-                    );
+                    // Phase 10.5 finding 5.1: same split as above but
+                    // for non-OutdatedCursor protocol-level info /
+                    // error frames under `on_protocol_error`.
+                    match policies.protocol_error_action(&relay, &name, message.as_deref()) {
+                        PolicyAction::Continue => {
+                            info!(
+                                target: "horizon_firehose::metrics",
+                                event_type = "protocol_info",
+                                relay = %relay,
+                                info_name = %name,
+                                message = ?message,
+                                policy = "reconnect_from_live_tip",
+                                "relay info frame (policy: continue)"
+                            );
+                        }
+                        PolicyAction::Exit(exit) => {
+                            warn!(
+                                target: "horizon_firehose::metrics",
+                                event_type = "policy_exit",
+                                relay = %relay,
+                                info_name = %name,
+                                message = ?message,
+                                policy = "on_protocol_error=exit",
+                                reason = %exit.reason,
+                                "operator-configured policy_exit on protocol info frame; initiating shutdown",
+                            );
+                            let _ = policy_exit_tx.send(exit);
+                            let _ = shutdown_tx.send(true);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1055,6 +1226,59 @@ mod tests {
         let frame = frame_with_body(&body);
         let err = preflight_scan(&frame, MAX_PREFLIGHT_DEPTH).unwrap_err();
         assert!(matches!(err, DecodeError::MalformedCbor(_)));
+    }
+
+    #[test]
+    fn preflight_returns_consumed_byte_count_at_end_of_two_top_level_values() {
+        // Phase 10.5 finding 3.4: preflight must report where the
+        // second top-level value ended, so `decode_frame` can detect
+        // any trailing bytes and reject them before `decode_all`
+        // feeds them to the recursive decoders.
+        let body = vec![0xA0]; // empty map
+        let frame = frame_with_body(&body);
+        let consumed = preflight_scan(&frame, MAX_PREFLIGHT_DEPTH).unwrap();
+        assert_eq!(
+            consumed,
+            frame.len(),
+            "preflight must consume all bytes of a well-formed header+body frame"
+        );
+    }
+
+    #[test]
+    fn decode_frame_rejects_three_top_level_values() {
+        // Minimal hostile frame: valid header + valid body + stray
+        // trailing CBOR integer. The preflight walks only the first
+        // two (by construction: `stack.push(2)`), leaving the
+        // trailing byte unconsumed — `decode_frame`'s new check fires.
+        let body = vec![0xA0]; // empty map
+        let mut frame = frame_with_body(&body);
+        frame.push(0x00); // extra top-level CBOR integer (value 0)
+        let err = decode_frame(&frame, "ws://t").unwrap_err();
+        match err {
+            DecodeError::ExtraTopLevelValues { got_bytes_after } => {
+                assert_eq!(got_bytes_after, 1);
+            }
+            other => panic!("expected ExtraTopLevelValues, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_frame_rejects_adversarial_three_top_level_fixture() {
+        // Phase 10.5 finding 3.4: reads the committed adversarial
+        // fixture (curated_00.bin + one trailing byte) and confirms
+        // the decoder rejects it at the boundary-gap guard, not
+        // later in the recursive decoders. This is the integration
+        // proof for the inline `decode_frame_rejects_three_top_level_values`
+        // unit test above.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/adversarial/frame_with_three_top_level_values.bin");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("missing adversarial fixture at {}: {e}", path.display()));
+        let err = decode_frame(&bytes, "ws://t").unwrap_err();
+        assert!(
+            matches!(err, DecodeError::ExtraTopLevelValues { .. }),
+            "expected ExtraTopLevelValues, got {err:?}"
+        );
     }
 
     #[test]
@@ -1355,5 +1579,118 @@ mod tests {
             DecodedFrame::Info { .. } => "info",
             DecodedFrame::Skipped { .. } => "skipped",
         }
+    }
+
+    // ─── Phase 10.5 finding 5.1: policy-dispatch unit tests ───────────
+
+    fn policies(stale: StaleCursorPolicy, proto: ProtocolErrorPolicy) -> DecoderPolicies {
+        DecoderPolicies {
+            on_stale_cursor: stale,
+            on_protocol_error: proto,
+        }
+    }
+
+    #[test]
+    fn outdated_cursor_with_live_tip_policy_continues() {
+        let p = policies(
+            StaleCursorPolicy::LiveTip,
+            ProtocolErrorPolicy::ReconnectFromLiveTip,
+        );
+        assert!(matches!(
+            p.outdated_cursor_action("wss://bsky.network", None),
+            PolicyAction::Continue
+        ));
+    }
+
+    #[test]
+    fn outdated_cursor_with_exit_policy_yields_shutdown_reason() {
+        let p = policies(
+            StaleCursorPolicy::Exit,
+            ProtocolErrorPolicy::ReconnectFromLiveTip,
+        );
+        match p.outdated_cursor_action("wss://bsky.network", Some("cursor is too old")) {
+            PolicyAction::Exit(PolicyExit { reason }) => {
+                assert!(
+                    reason.contains("on_stale_cursor=exit"),
+                    "reason must name the tripping policy: {reason}"
+                );
+                assert!(
+                    reason.contains("wss://bsky.network"),
+                    "reason must include the relay URL so ops logs attribute correctly: {reason}"
+                );
+                assert!(
+                    reason.contains("cursor is too old"),
+                    "reason must echo the server message: {reason}"
+                );
+            }
+            other => panic!("expected Exit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_error_with_reconnect_policy_continues() {
+        let p = policies(
+            StaleCursorPolicy::LiveTip,
+            ProtocolErrorPolicy::ReconnectFromLiveTip,
+        );
+        assert!(matches!(
+            p.protocol_error_action("wss://bsky.network", "ServerOverloaded", None),
+            PolicyAction::Continue
+        ));
+    }
+
+    #[test]
+    fn protocol_error_with_exit_policy_yields_shutdown_reason() {
+        let p = policies(StaleCursorPolicy::LiveTip, ProtocolErrorPolicy::Exit);
+        match p.protocol_error_action(
+            "wss://bsky.network",
+            "ServerOverloaded",
+            Some("retry later"),
+        ) {
+            PolicyAction::Exit(PolicyExit { reason }) => {
+                assert!(
+                    reason.contains("on_protocol_error=exit"),
+                    "reason must name the tripping policy: {reason}"
+                );
+                assert!(
+                    reason.contains("ServerOverloaded"),
+                    "reason must include the info-frame name: {reason}"
+                );
+                assert!(
+                    reason.contains("wss://bsky.network"),
+                    "reason must echo the relay URL: {reason}"
+                );
+            }
+            other => panic!("expected Exit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policies_are_independent_knobs() {
+        // Cross-check: setting exit on one axis must NOT exit the
+        // other. A stale=exit config keeps continuing on generic
+        // protocol errors, and vice versa.
+        let stale_only = policies(
+            StaleCursorPolicy::Exit,
+            ProtocolErrorPolicy::ReconnectFromLiveTip,
+        );
+        assert!(matches!(
+            stale_only.protocol_error_action("wss://r", "Warn", None),
+            PolicyAction::Continue
+        ));
+        assert!(matches!(
+            stale_only.outdated_cursor_action("wss://r", None),
+            PolicyAction::Exit(_)
+        ));
+
+        let proto_only = policies(StaleCursorPolicy::LiveTip, ProtocolErrorPolicy::Exit);
+        assert!(matches!(
+            proto_only.outdated_cursor_action("wss://r", None),
+            PolicyAction::Continue
+        ));
+        assert!(matches!(
+            proto_only.protocol_error_action("wss://r", "Warn", None),
+            PolicyAction::Exit(_)
+        ));
     }
 }

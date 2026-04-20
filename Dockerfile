@@ -86,9 +86,9 @@ WORKDIR /app
 COPY --from=builder /build/target/release/horizon-firehose /app/horizon-firehose
 
 # Config: operators mount their config.toml into /app/config.toml.
-# Alternatively, set HORIZON_FIREHOSE_CONFIG to point elsewhere.
-# We don't bundle a default config — the consumer needs a real relay
-# URL, Redis URL, etc. and there's no universally-correct default.
+# Alternatively, set HF_CONFIG_PATH to point elsewhere. We don't
+# bundle a default config — the consumer needs a real relay URL,
+# Redis URL, etc. and there's no universally-correct default.
 #
 # No HEALTHCHECK: horizon-firehose is a stream consumer with no HTTP
 # endpoint. Process-liveness (Docker / Kubernetes / systemd all

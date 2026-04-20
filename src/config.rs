@@ -20,9 +20,18 @@ use crate::error::{Error, Result, SUPPORTED_CONFIG_VERSION};
 /// Default location the loader checks if no path is supplied.
 pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
-/// Env-var that overrides the config file path itself (read by `main`,
-/// not by figment, since it controls *which* file we point figment at).
-pub const CONFIG_PATH_ENV: &str = "HORIZON_FIREHOSE_CONFIG";
+/// Env-var that overrides the config file path itself.
+///
+/// **Deliberately outside the `HORIZON_FIREHOSE_` namespace** — figment's
+/// `Env::prefixed("HORIZON_FIREHOSE_").split("__")` would otherwise claim
+/// any bare `HORIZON_FIREHOSE_CONFIG` as a top-level field `config`, and
+/// `deny_unknown_fields` would then reject startup even though the
+/// operator did nothing wrong (Phase 10.5 finding 5.2 caught this with
+/// `env_var_overrides_with_config_path_env_also_set`). `HF_CONFIG_PATH`
+/// lives in its own namespace so the two reading strategies coexist
+/// cleanly: `main` reads this directly and passes the resolved file to
+/// figment, which then merges `HORIZON_FIREHOSE_*` on top.
+pub const CONFIG_PATH_ENV: &str = "HF_CONFIG_PATH";
 
 /// Top-level config struct. Fields map 1:1 to the TOML schema in
 /// DESIGN.md §4.
@@ -170,7 +179,7 @@ pub enum LogFormat {
 }
 
 impl Config {
-    /// Resolve which config path to use, honouring `HORIZON_FIREHOSE_CONFIG`
+    /// Resolve which config path to use, honouring `HF_CONFIG_PATH`
     /// or falling back to `./config.toml`.
     pub fn resolve_path() -> PathBuf {
         std::env::var(CONFIG_PATH_ENV)
@@ -643,6 +652,25 @@ max_stream_len = 500000
             jail.set_env("HORIZON_FIREHOSE_RELAY__URL", "http://nope");
             let err = Config::load(&path).unwrap_err();
             assert!(matches!(err, Error::ConfigValidation(_)));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn env_var_overrides_with_config_path_env_also_set() {
+        // Phase 10.5 finding 5.2: the config-path selector used to live
+        // at `HORIZON_FIREHOSE_CONFIG`, which collided with figment's
+        // `Env::prefixed("HORIZON_FIREHOSE_").split("__")` — figment
+        // would parse it as a top-level field `config` and
+        // `deny_unknown_fields` would reject startup. The fix was to
+        // move the selector to `HF_CONFIG_PATH` (different namespace).
+        // This test pins that: with `HF_CONFIG_PATH` set, startup
+        // must succeed.
+        Jail::expect_with(|jail| {
+            let path = write_config(jail, MINIMAL_CONFIG);
+            jail.set_env(CONFIG_PATH_ENV, path.to_str().unwrap());
+            let cfg = Config::load(&path).expect("should load when HF_CONFIG_PATH is set");
+            assert_eq!(cfg.config_version, 1);
             Ok(())
         });
     }

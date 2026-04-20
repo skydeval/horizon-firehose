@@ -1,6 +1,13 @@
 /target
 
-# Captured raw frames live here. The bulk corpus is regenerated on
-# demand via `cargo run --bin capture-fixtures`; only specific curated
-# fixtures (committed via `git add -f`) belong in source control.
-tests/fixtures/
+# Captured raw frames live here. The full corpus (1000+ frames) is
+# regenerated on demand via `cargo run --bin capture-fixtures` for
+# local exploration — we don't commit that volume.
+#
+# A small committed subset lives at `tests/fixtures/ci_*.bin` + the
+# paired `manifest.json` so the pipeline / decoder integration tests
+# actually run in CI instead of silently SKIPping (Phase 10.5
+# finding 4.1). Everything else under this directory stays ignored.
+tests/fixtures/*
+!tests/fixtures/manifest.json
+!tests/fixtures/ci_*.bin

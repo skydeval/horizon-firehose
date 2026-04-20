@@ -125,7 +125,7 @@ async fn end_to_end_pipeline_delivers_event_to_backend() {
 
     let backend = Arc::new(InMemoryBackend::new());
     let cursors = Cursors::new();
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let (event_tx, event_rx) = mpsc::channel::<PublishOp>(128);
     let (filtered_tx, filtered_rx) = mpsc::channel::<PublishOp>(128);
@@ -138,7 +138,24 @@ async fn end_to_end_pipeline_delivers_event_to_backend() {
         Metrics::new(),
     );
     let ws_control = ws_reader.control();
-    let decoder_h = decoder::spawn(ws_reader, event_tx, Metrics::new(), ws_control);
+    // Phase 10.5 finding 5.1: decoder needs policy config + exit
+    // plumbing. Tests use LiveTip + ReconnectFromLiveTip (the default
+    // behaviour) and ignore the policy-exit channel since neither
+    // test triggers a policy-exit frame.
+    let (decoder_policy_exit_tx, _decoder_policy_exit_rx) =
+        mpsc::unbounded_channel::<decoder::PolicyExit>();
+    let decoder_h = decoder::spawn(
+        ws_reader,
+        event_tx,
+        Metrics::new(),
+        ws_control,
+        decoder::DecoderPolicies {
+            on_stale_cursor: crate::config::StaleCursorPolicy::LiveTip,
+            on_protocol_error: crate::config::ProtocolErrorPolicy::ReconnectFromLiveTip,
+        },
+        shutdown_tx.clone(),
+        decoder_policy_exit_tx,
+    );
     let router_h = router::spawn(
         RouterOptions {
             record_types: vec![],
@@ -174,7 +191,7 @@ async fn end_to_end_pipeline_delivers_event_to_backend() {
     );
 
     // Shut down by flipping the global signal, same way `run_async` does.
-    let _ = _shutdown_tx.send(true);
+    let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), decoder_h.join()).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), router_h.shutdown()).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), publisher_h.join()).await;
@@ -207,7 +224,24 @@ async fn shutdown_cascade_finalises_cursor_within_budget() {
         Metrics::new(),
     );
     let ws_control = ws_reader.control();
-    let decoder_h = decoder::spawn(ws_reader, event_tx, Metrics::new(), ws_control);
+    // Phase 10.5 finding 5.1: decoder needs policy config + exit
+    // plumbing. Tests use LiveTip + ReconnectFromLiveTip (the default
+    // behaviour) and ignore the policy-exit channel since neither
+    // test triggers a policy-exit frame.
+    let (decoder_policy_exit_tx, _decoder_policy_exit_rx) =
+        mpsc::unbounded_channel::<decoder::PolicyExit>();
+    let decoder_h = decoder::spawn(
+        ws_reader,
+        event_tx,
+        Metrics::new(),
+        ws_control,
+        decoder::DecoderPolicies {
+            on_stale_cursor: crate::config::StaleCursorPolicy::LiveTip,
+            on_protocol_error: crate::config::ProtocolErrorPolicy::ReconnectFromLiveTip,
+        },
+        shutdown_tx.clone(),
+        decoder_policy_exit_tx,
+    );
     let router_h = router::spawn(
         RouterOptions {
             record_types: vec![],

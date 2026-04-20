@@ -92,12 +92,21 @@ jobs:
 
   # ─── Dependency vulnerability scan ─────────────────────────────────
   # Uses the official RustSec action. Separate job so advisory-DB
-  # flakes don't block other lanes; `continue-on-error` keeps a
-  # newly-published advisory from breaking main until we've
-  # triaged it.
+  # flakes don't block other lanes, and `continue-on-error: true`
+  # means a newly-published advisory doesn't gate merges — we'd
+  # rather see a yellow "continue" result on main than a red block
+  # while we triage. (Phase 10.5 finding 2.1 caught that the comment
+  # promised this but the flag wasn't set.)
+  #
+  # Fork PRs don't have the `GITHUB_TOKEN` scopes the action needs
+  # (see `permissions:` below), so we skip the job entirely on PRs
+  # coming from forks rather than failing them for a protocol reason
+  # — Phase 10.5 finding 2.2.
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    continue-on-error: true
     # GitHub has tightened the default GITHUB_TOKEN scope so that a
     # push-triggered workflow gets `contents: read` and little else.
     # `rustsec/audit-check` posts its findings as a Check Run (needs
@@ -122,14 +131,20 @@ jobs:
   # ─── Docker image build + smoke test ───────────────────────────────
   # Phase 9: build the multi-stage production image and confirm the
   # binary inside actually runs (proves toolchain unification —
-  # glibc ABI from the `rust:1.85-bookworm` builder has to match the
+  # glibc ABI from the `rust:1.95-bookworm` builder has to match the
   # glibc the `distroless/cc-debian12` runtime carries, and rustls
   # + native-tls both need to link against libssl correctly). Does
   # NOT push to any registry; image publication is deliberately a
   # separate concern.
+  #
+  # Fork PRs can't write to the GHA cache (the `actions: write`
+  # permission isn't granted on `secrets.GITHUB_TOKEN` from a fork),
+  # and GitHub's Docker registry access from fork PRs is restricted.
+  # Skip the job rather than fail it — Phase 10.5 finding 2.2.
   docker-build:
     name: docker build + smoke
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     # `docker/build-push-action@v5` with `cache-to: type=gha` writes
     # to the GitHub Actions cache service, which requires
     # `actions: write` on the job's token. Default push-triggered

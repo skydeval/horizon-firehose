@@ -1,0 +1,113 @@
+{
+  "capture_started_at": "2026-04-20T04:21:55.566955Z",
+  "capture_ended_at": "2026-04-20T04:21:55.566955Z",
+  "relay_url": "curated-subset://phase-10.5-finding-4.1",
+  "frame_count": 21,
+  "frames": [
+    {
+      "filename": "ci_00.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 4437
+    },
+    {
+      "filename": "ci_01.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 6581
+    },
+    {
+      "filename": "ci_02.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 5418
+    },
+    {
+      "filename": "ci_03.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 3595
+    },
+    {
+      "filename": "ci_04.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 5566
+    },
+    {
+      "filename": "ci_05.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 4916
+    },
+    {
+      "filename": "ci_06.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 2502
+    },
+    {
+      "filename": "ci_07.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 8914
+    },
+    {
+      "filename": "ci_08.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 6160
+    },
+    {
+      "filename": "ci_09.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 7076
+    },
+    {
+      "filename": "ci_10.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 6856
+    },
+    {
+      "filename": "ci_11.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 3947
+    },
+    {
+      "filename": "ci_12.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 5527
+    },
+    {
+      "filename": "ci_13.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 10868
+    },
+    {
+      "filename": "ci_14.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 1872
+    },
+    {
+      "filename": "ci_15.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 5813
+    },
+    {
+      "filename": "ci_16.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 6447
+    },
+    {
+      "filename": "ci_17.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 6965
+    },
+    {
+      "filename": "ci_18.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 3634
+    },
+    {
+      "filename": "ci_19.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 6073
+    },
+    {
+      "filename": "ci_20.bin",
+      "timestamp_ms": 0,
+      "size_bytes": 3885
+    }
+  ]
+}

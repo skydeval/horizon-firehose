@@ -485,7 +485,7 @@ HORIZON_FIREHOSE_CONFIG_VERSION=1
 
 The double-underscore convention is deliberate. Many of our field names already contain single underscores (`reconnect_initial_delay_ms`, `failover_cooldown_seconds`, `max_event_size_bytes`, `cleanup_unknown_cursors`, etc.), so a single-underscore separator would be ambiguous: `HORIZON_FIREHOSE_RELAY_RECONNECT_INITIAL_DELAY_MS` could split as `relay.reconnect.initial.delay.ms` (wrong) or `relay.reconnect_initial_delay_ms` (right). Splitting on `__` makes the intent unambiguous and matches figment's standard convention.
 
-The path that selects which config file to load is itself controlled by `HORIZON_FIREHOSE_CONFIG` (no double underscore — this overrides the file path, not a TOML field). Default is `./config.toml`.
+The path that selects which config file to load is controlled by `HF_CONFIG_PATH` — **deliberately outside the `HORIZON_FIREHOSE_` namespace**. Default is `./config.toml`. The prior `HORIZON_FIREHOSE_CONFIG` name collided with figment's env reader: `Env::prefixed("HORIZON_FIREHOSE_").split("__")` claimed `HORIZON_FIREHOSE_CONFIG` (no `__`) as a top-level field `config`, and `deny_unknown_fields` then rejected startup with `UnknownField("config", [...])`. Phase 10.5 finding 5.2 confirmed this with an integration test and moved the selector into its own namespace. `HF_CONFIG_PATH` is read by `main` directly; figment never sees it.
 
 ### config version bump policy
 

@@ -2,12 +2,12 @@
 #
 # Copy this file to `config.toml` and edit for your deployment.
 # The runtime config path defaults to `./config.toml` and can be
-# overridden with the HORIZON_FIREHOSE_CONFIG environment variable.
+# overridden with the HF_CONFIG_PATH environment variable.
 #
-# Any value below can be overridden with an environment variable using
-# the HORIZON_FIREHOSE_ prefix. Sections are separated from field names
-# by a *double* underscore; single underscores are kept inside field
-# names that already contain them (e.g. reconnect_initial_delay_ms).
+# Any TOML field below can be overridden with an environment variable
+# using the HORIZON_FIREHOSE_ prefix. Sections are separated from field
+# names by a *double* underscore; single underscores are kept inside
+# field names that already contain them (e.g. reconnect_initial_delay_ms).
 # Single-underscore as a section separator would be ambiguous, since
 # many of our field names contain underscores themselves.
 #
@@ -18,8 +18,11 @@
 #   HORIZON_FIREHOSE_LOGGING__LEVEL=debug
 #   HORIZON_FIREHOSE_CONFIG_VERSION=1     # top-level field, no `__`
 #
-# HORIZON_FIREHOSE_CONFIG itself selects which file to load (default
-# `./config.toml`); it isn't a TOML field, so it has no `__` either.
+# HF_CONFIG_PATH (not HORIZON_FIREHOSE_*) selects which TOML file to
+# load. It lives in a separate namespace deliberately: figment's
+# `Env::prefixed("HORIZON_FIREHOSE_")` would otherwise claim a bare
+# `HORIZON_FIREHOSE_CONFIG` as a TOML field and `deny_unknown_fields`
+# would reject startup. Phase 10.5 finding 5.2.
 
 # Schema version. The consumer rejects newer versions with a migration
 # message. See DESIGN.md §4 "config version bump policy".
