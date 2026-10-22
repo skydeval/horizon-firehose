@@ -37,6 +37,13 @@
 //!   *not* advancing would leave us permanently stuck on replay.
 //! - `fail_hard`: ERROR, stop the task, return an error from the run
 //!   loop. The main-task coordinator propagates it and exits non-zero.
+//!
+//! # Replay guard (2026-10-22)
+//!
+//! Before anything else, an event whose seq is at or below its
+//! relay's published cursor is dropped and counted rather than
+//! XADDed; a long run of such drops is handled as a relay sequence
+//! reset per `on_stale_cursor`. See [`ReplayGuard`].
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -45,11 +52,12 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::backend::{BackendError, StreamBackend};
-use crate::config::OversizePolicy;
-use crate::cursor::Cursors;
+use crate::config::{OversizePolicy, StaleCursorPolicy};
+use crate::cursor::{Cursors, cursor_key};
+use crate::decoder::PolicyExit;
 use crate::event::Event;
 use crate::metrics::Metrics;
 
@@ -75,6 +83,15 @@ pub enum PublishOp {
     Skip { relay: String, seq: u64 },
 }
 
+/// Where the replay guard sends a policy exit: the same coordinator
+/// channel the decoder uses for `on_stale_cursor = "exit"`, plus the
+/// global shutdown watch.
+#[derive(Debug, Clone)]
+pub struct PolicyExitSink {
+    pub policy_exit_tx: mpsc::UnboundedSender<PolicyExit>,
+    pub shutdown_tx: watch::Sender<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PublisherOptions {
     pub stream_key: String,
@@ -85,6 +102,17 @@ pub struct PublisherOptions {
     pub retry_max: Duration,
     /// How often to re-log a warning while Redis is down.
     pub retry_warn_interval: Duration,
+    /// Replay guard: how long a run of seq ≤ cursor drops may last,
+    /// with no event advancing that relay's cursor, before the relay
+    /// is treated as having reset its sequence. Config:
+    /// `cursor.relay_reset_after_seconds`.
+    pub relay_reset_after: Duration,
+    /// Replay guard: what to do on a suspected relay sequence reset.
+    /// Config: `cursor.on_stale_cursor`.
+    pub on_stale_cursor: StaleCursorPolicy,
+    /// Replay guard: where an `Exit` goes. `None` (unit tests) logs
+    /// the reset and keeps dropping.
+    pub policy_exit: Option<PolicyExitSink>,
 }
 
 impl PublisherOptions {
@@ -103,6 +131,9 @@ impl PublisherOptions {
             retry_initial: Duration::from_millis(500),
             retry_max: Duration::from_secs(30),
             retry_warn_interval: Duration::from_secs(30),
+            relay_reset_after: Duration::from_secs(600),
+            on_stale_cursor: StaleCursorPolicy::LiveTip,
+            policy_exit: None,
         }
     }
 }
@@ -133,6 +164,9 @@ pub struct PublisherStats {
     /// These advanced the cursor without XADDing anything — e.g.
     /// `#sync` frames the decoder forwarded.
     pub skip_advances: u64,
+    /// 2026-10-22 replay guard: events not XADDed because their seq
+    /// was at or below the cursor already published for their relay.
+    pub replayed_dropped: u64,
     /// Phase 8.5 follow-up finding 4.10: true when `join`/`shutdown`
     /// surfaced a `JoinError` (the task panicked). In that case the
     /// numeric fields above are `Default` — the actual pre-panic
@@ -262,6 +296,7 @@ pub async fn run<B: StreamBackend>(
     metrics: Arc<Metrics>,
 ) -> Result<PublisherStats, PublisherError> {
     let mut stats = PublisherStats::default();
+    let mut guard = ReplayGuard::default();
 
     loop {
         // Drain-first policy: `biased;` with `input` checked before
@@ -294,17 +329,34 @@ pub async fn run<B: StreamBackend>(
             // the cursor for the sync. The publisher is now the sole
             // writer to the in-memory cursor.
             PublishOp::Skip { relay, seq } => {
+                let before = cursors.get(&relay).await;
                 cursors.advance(&relay, seq).await;
+                if before.is_none_or(|c| seq > c) {
+                    // A forward skip is progress: any replay-drop run
+                    // on this relay is over.
+                    guard.end_run(&relay);
+                }
                 stats.skip_advances += 1;
                 continue;
             }
         };
         stats.events_in += 1;
 
+        let relay = event.relay().to_string();
+
+        // 2026-10-22 replay guard: never XADD a seq this relay has
+        // already published. See `ReplayGuard`.
+        match guard.check(&cursors, &relay, seq, &opts, &metrics).await {
+            GuardVerdict::Publish => {}
+            GuardVerdict::Drop => {
+                stats.replayed_dropped += 1;
+                continue;
+            }
+        }
+
         // Serialise once: we need both the size check and the bytes we
         // eventually hand to XADD.
         let event_type = event.type_name();
-        let relay = event.relay().to_string();
         let data = match event.to_json_bytes() {
             Ok(bytes) => bytes,
             Err(source) => {
@@ -395,6 +447,212 @@ pub async fn run<B: StreamBackend>(
     }
 
     Ok(stats)
+}
+
+/// What the replay guard decided for one event.
+#[derive(Debug, PartialEq, Eq)]
+enum GuardVerdict {
+    Publish,
+    Drop,
+}
+
+/// One unbroken run of replay drops on a relay.
+#[derive(Debug)]
+struct DropRun {
+    started: Instant,
+    first_seq: u64,
+    last_seq: u64,
+    count: u64,
+    cursor: u64,
+    /// The reset policy already fired for this run (Exit, or Exit
+    /// with no sink). Prevents re-firing on every later drop.
+    reset_handled: bool,
+}
+
+/// 2026-10-22 replay guard (defence in depth behind the per-dial
+/// cursor fix in `ws_reader::connect_url_fn`).
+///
+/// # Rule
+///
+/// An event whose `seq` is **at or below** the cursor already
+/// published for its relay is not XADDed. The cursor is "last
+/// successfully XADDed (or skip-advanced) seq", so such an event is
+/// one this relay already delivered downstream. Equal counts as
+/// published. Seq order is per relay URL; the comparison is against
+/// that relay's own cursor only. A relay with no cursor yet (fresh
+/// start, live tip) is never guarded.
+///
+/// Drops are counted in `replayed_events_dropped_total` and logged
+/// once per burst: a WARN when a run of drops starts and an INFO
+/// summary when the next event advances the cursor.
+///
+/// Where legitimate drops come from: after a reconnect, frames from
+/// the old connection still sitting in the pipeline channels (up to
+/// ~3 k) are published first, then the new connection re-sends the
+/// same seqs from the cursor it was given. Those duplicates are
+/// dropped here instead of re-XADDed.
+///
+/// The publisher is the sole cursor writer, so the read-compare here
+/// is race-free.
+///
+/// # Relay sequence reset
+///
+/// A relay that restarts its numbering (a rebuilt relay instance)
+/// sends live events with seqs below our cursor. Dropping those
+/// forever would be a silent outage. So if a drop run lasts
+/// `relay_reset_after` (config `cursor.relay_reset_after_seconds`,
+/// default 600 s) with no event advancing the cursor, the guard
+/// treats it as a reset, counts `relay_seq_resets_total`, and applies
+/// `on_stale_cursor` — the same knob as a relay rejecting our cursor:
+///
+/// - `exit`: log ERROR with the remediation, send a policy exit to the
+///   coordinator and flip global shutdown — the same path as the
+///   decoder's `OutdatedCursor` exit. The process exits non-zero after
+///   the normal drain and cursor flush. A restart resumes from the
+///   saved cursor; if the relay really did reset, the drops resume
+///   and the process exits again every `relay_reset_after`, a visible
+///   crash loop until the operator deletes the cursor key.
+/// - `live_tip`: log WARN, move the relay's cursor back to just below
+///   the current seq ([`Cursors::rebase`]) and publish from there on.
+///   Events dropped during the window are lost, matching what
+///   `live_tip` already means for a rejected cursor.
+///
+/// A false positive needs ≥ `relay_reset_after` of drops with no
+/// advance, i.e. a relay that ignores `?cursor=` and replays more
+/// than that much history. `exit` then restarts the process (which
+/// re-dials with the saved cursor); `live_tip` re-publishes the rest
+/// of that replay as duplicates. Both are recoverable; dropping
+/// forever is not.
+#[derive(Debug, Default)]
+struct ReplayGuard {
+    runs: std::collections::HashMap<String, DropRun>,
+}
+
+impl ReplayGuard {
+    async fn check(
+        &mut self,
+        cursors: &Cursors,
+        relay: &str,
+        seq: u64,
+        opts: &PublisherOptions,
+        metrics: &Metrics,
+    ) -> GuardVerdict {
+        let cursor = match cursors.get(relay).await {
+            Some(c) if seq <= c => c,
+            _ => {
+                self.end_run(relay);
+                return GuardVerdict::Publish;
+            }
+        };
+
+        metrics
+            .replayed_events_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+        let run = self.runs.entry(relay.to_string()).or_insert_with(|| {
+            warn!(
+                target: "horizon_firehose::metrics",
+                event_type = "replay_drop_started",
+                relay = %relay,
+                first_dropped_seq = seq,
+                cursor,
+                "relay sent events at or below the published cursor; dropping them \
+                 (not XADDed) until it passes the cursor"
+            );
+            DropRun {
+                started: Instant::now(),
+                first_seq: seq,
+                last_seq: seq,
+                count: 0,
+                cursor,
+                reset_handled: false,
+            }
+        });
+        run.last_seq = seq;
+        run.count += 1;
+
+        if run.reset_handled || run.started.elapsed() < opts.relay_reset_after {
+            return GuardVerdict::Drop;
+        }
+
+        // Drops have run for `relay_reset_after` with no advance:
+        // treat as a relay sequence reset.
+        metrics
+            .relay_seq_resets_total
+            .fetch_add(1, Ordering::Relaxed);
+        let key = cursor_key(relay);
+        match opts.on_stale_cursor {
+            StaleCursorPolicy::LiveTip => {
+                warn!(
+                    target: "horizon_firehose::metrics",
+                    event_type = "relay_seq_reset",
+                    relay = %relay,
+                    policy = "on_stale_cursor=live_tip",
+                    seq,
+                    cursor = run.cursor,
+                    dropped = run.count,
+                    first_dropped_seq = run.first_seq,
+                    drop_secs = run.started.elapsed().as_secs(),
+                    "relay sequence reset suspected; accepting the relay's new numbering \
+                     (cursor moves back; events dropped during the window are lost)"
+                );
+                self.runs.remove(relay);
+                cursors.rebase(relay, seq.saturating_sub(1)).await;
+                GuardVerdict::Publish
+            }
+            StaleCursorPolicy::Exit => {
+                run.reset_handled = true;
+                let reason = format!(
+                    "on_stale_cursor=exit after relay sequence reset suspected on {relay}: \
+                     {} events at or below cursor {} over {}s (seq {}..={}). If the relay \
+                     really reset, delete the cursor key to resume from its live tip: \
+                     redis-cli -u \"$REDIS_URL\" DEL {key}",
+                    run.count,
+                    run.cursor,
+                    run.started.elapsed().as_secs(),
+                    run.first_seq,
+                    run.last_seq,
+                );
+                error!(
+                    target: "horizon_firehose::metrics",
+                    event_type = "policy_exit",
+                    relay = %relay,
+                    policy = "on_stale_cursor=exit",
+                    reason = %reason,
+                    "relay sequence reset suspected; initiating shutdown"
+                );
+                if let Some(sink) = &opts.policy_exit {
+                    let _ = sink.policy_exit_tx.send(PolicyExit {
+                        task: "publisher",
+                        reason,
+                    });
+                    let _ = sink.shutdown_tx.send(true);
+                }
+                // Keep draining (and dropping) rather than breaking:
+                // the shutdown cascade closes our input, and the
+                // coordinator turns the policy exit into a non-zero
+                // exit after the final cursor flush.
+                GuardVerdict::Drop
+            }
+        }
+    }
+
+    /// The relay advanced its cursor: close any drop run with a
+    /// one-line summary.
+    fn end_run(&mut self, relay: &str) {
+        if let Some(run) = self.runs.remove(relay) {
+            info!(
+                target: "horizon_firehose::metrics",
+                event_type = "replay_drop_ended",
+                relay = %relay,
+                dropped = run.count,
+                first_dropped_seq = run.first_seq,
+                last_dropped_seq = run.last_seq,
+                cursor = run.cursor,
+                drop_secs = run.started.elapsed().as_secs_f64(),
+                "relay passed the published cursor; replay drops ended"
+            );
+        }
+    }
 }
 
 enum XaddOutcome {
@@ -518,6 +776,9 @@ mod tests {
             retry_initial: Duration::from_millis(10),
             retry_max: Duration::from_millis(40),
             retry_warn_interval: Duration::from_millis(50),
+            relay_reset_after: Duration::from_secs(600),
+            on_stale_cursor: StaleCursorPolicy::LiveTip,
+            policy_exit: None,
         }
     }
 
@@ -954,5 +1215,228 @@ mod tests {
         assert_eq!(stats.skip_advances, 1);
         assert_eq!(c.get(RELAY).await, Some(102));
         assert_eq!(b.xlen("firehose:events").await.unwrap(), 2);
+    }
+
+    // ─── 2026-10-22 replay guard ──────────────────────────────────────
+
+    fn commit_on(relay: &str, n: u64) -> Event {
+        let Event::Commit(mut c) = tiny_commit(n) else {
+            unreachable!()
+        };
+        c.relay = relay.into();
+        Event::Commit(c)
+    }
+
+    async fn send_seqs(tx: &mpsc::Sender<PublishOp>, seqs: &[u64]) {
+        for &s in seqs {
+            tx.send(PublishOp::Publish(tiny_commit(s), s))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn events_at_or_below_saved_cursor_are_dropped_and_counted() {
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        // As if loaded from Redis at startup, or published earlier.
+        c.advance(RELAY, 100).await;
+        let metrics = m();
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            opts(1000, 1 << 20, OversizePolicy::SkipWithLog),
+            rx,
+            metrics.clone(),
+        );
+
+        // 98, 99: replayed history. 100: equal = already published.
+        // 101, 102: new.
+        send_seqs(&tx, &[98, 99, 100, 101, 102]).await;
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.events_in, 5);
+        assert_eq!(stats.replayed_dropped, 3);
+        assert_eq!(stats.events_published, 2);
+        assert_eq!(
+            metrics
+                .replayed_events_dropped_total
+                .load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(metrics.relay_seq_resets_total.load(Ordering::Relaxed), 0);
+        assert_eq!(b.xlen("firehose:events").await.unwrap(), 2);
+        let seqs: Vec<_> = b
+            .stream_entries("firehose:events")
+            .await
+            .into_iter()
+            .map(|(_, _, fields)| {
+                fields
+                    .into_iter()
+                    .find(|(k, _)| k == "seq")
+                    .map(|(_, v)| String::from_utf8(v).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(seqs, vec!["101", "102"]);
+        assert_eq!(c.get(RELAY).await, Some(102));
+    }
+
+    #[tokio::test]
+    async fn replay_guard_is_per_relay() {
+        // A high cursor on one relay must not drop another relay's
+        // (independently numbered) events.
+        const OTHER: &str = "wss://other.test/xrpc/com.atproto.sync.subscribeRepos";
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 1_000_000).await;
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            opts(1000, 1 << 20, OversizePolicy::SkipWithLog),
+            rx,
+            m(),
+        );
+        tx.send(PublishOp::Publish(commit_on(OTHER, 1), 5))
+            .await
+            .unwrap();
+        tx.send(PublishOp::Publish(commit_on(RELAY, 2), 5))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.events_published, 1);
+        assert_eq!(stats.replayed_dropped, 1);
+        assert_eq!(c.get(OTHER).await, Some(5));
+        assert_eq!(c.get(RELAY).await, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn short_drop_runs_separated_by_progress_never_count_as_reset() {
+        // Two separate overlap bursts, each well under the threshold,
+        // with time passing between them: the clock restarts when the
+        // relay advances, so neither is a reset.
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 100).await;
+        let metrics = m();
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            PublisherOptions {
+                relay_reset_after: Duration::from_millis(100),
+                on_stale_cursor: StaleCursorPolicy::Exit,
+                ..opts(1000, 1 << 20, OversizePolicy::SkipWithLog)
+            },
+            rx,
+            metrics.clone(),
+        );
+        send_seqs(&tx, &[50]).await;
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        send_seqs(&tx, &[101]).await;
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        send_seqs(&tx, &[60, 102]).await;
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.replayed_dropped, 2);
+        assert_eq!(stats.events_published, 2);
+        assert_eq!(metrics.relay_seq_resets_total.load(Ordering::Relaxed), 0);
+        assert_eq!(c.get(RELAY).await, Some(102));
+    }
+
+    #[tokio::test]
+    async fn relay_reset_under_live_tip_rebases_cursor_and_resumes_publishing() {
+        // A relay that restarted its numbering at 1 while our cursor
+        // is 1_000_000. After `relay_reset_after` of drops with no
+        // advance, live_tip accepts the new numbering.
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 1_000_000).await;
+        let metrics = m();
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            PublisherOptions {
+                relay_reset_after: Duration::from_millis(50),
+                on_stale_cursor: StaleCursorPolicy::LiveTip,
+                ..opts(1000, 1 << 20, OversizePolicy::SkipWithLog)
+            },
+            rx,
+            metrics.clone(),
+        );
+        send_seqs(&tx, &[1, 2]).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        send_seqs(&tx, &[3, 4]).await;
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.replayed_dropped, 2, "1 and 2 fell inside the window");
+        assert_eq!(
+            stats.events_published, 2,
+            "3 triggers the rebase, 4 follows"
+        );
+        assert_eq!(metrics.relay_seq_resets_total.load(Ordering::Relaxed), 1);
+        assert_eq!(c.get(RELAY).await, Some(4));
+    }
+
+    #[tokio::test]
+    async fn relay_reset_under_exit_raises_one_policy_exit_and_keeps_dropping() {
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 1_000_000).await;
+        let metrics = m();
+        let (exit_tx, mut exit_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            PublisherOptions {
+                relay_reset_after: Duration::from_millis(50),
+                on_stale_cursor: StaleCursorPolicy::Exit,
+                policy_exit: Some(PolicyExitSink {
+                    policy_exit_tx: exit_tx,
+                    shutdown_tx,
+                }),
+                ..opts(1000, 1 << 20, OversizePolicy::SkipWithLog)
+            },
+            rx,
+            metrics.clone(),
+        );
+        send_seqs(&tx, &[1]).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        send_seqs(&tx, &[2, 3]).await;
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        // Nothing below the cursor is ever published under `exit`,
+        // and the cursor never moves back.
+        assert_eq!(stats.events_published, 0);
+        assert_eq!(stats.replayed_dropped, 3);
+        assert_eq!(b.xlen("firehose:events").await.unwrap(), 0);
+        assert_eq!(c.get(RELAY).await, Some(1_000_000));
+        assert_eq!(metrics.relay_seq_resets_total.load(Ordering::Relaxed), 1);
+
+        let exit = exit_rx.try_recv().expect("policy exit raised");
+        assert_eq!(exit.task, "publisher");
+        assert!(
+            exit.reason.contains("on_stale_cursor=exit"),
+            "{}",
+            exit.reason
+        );
+        assert!(
+            exit.reason.contains("DEL firehose:cursor:"),
+            "{}",
+            exit.reason
+        );
+        assert!(exit_rx.try_recv().is_err(), "exit must fire once per run");
+        assert!(*shutdown_rx.borrow(), "global shutdown flipped");
     }
 }

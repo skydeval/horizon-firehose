@@ -174,7 +174,7 @@ horizon-firehose/
 
 ### error handling
 
-- **WebSocket disconnect.** Auto-reconnect via proto-blue-ws with exponential backoff (start 1s, cap at 60s). On reconnect, resume from the last saved cursor for the active relay. Log each attempt at INFO; escalate to WARN after 5 consecutive failures. Every reconnect logs with `total_reconnects_since_start` and `reconnects_last_hour` counters so operators can alert on their own baselines.
+- **WebSocket disconnect.** Auto-reconnect via proto-blue-ws with exponential backoff (start 1s, cap at 60s). On reconnect, resume from the last saved cursor for the active relay — on *every* dial, including the SDK's internal reconnects (see "every dial carries the current cursor" below). Log each attempt at INFO; escalate to WARN after 5 consecutive failures. Every reconnect logs with `total_reconnects_since_start` and `reconnects_last_hour` counters so operators can alert on their own baselines.
 
 - **Firehose protocol error frames.** On a `#info` frame with type `OutdatedCursor`, behave per `on_stale_cursor` config. On any other error frame type, log at ERROR and reconnect based on `on_protocol_error` config (default: `reconnect_from_live_tip`).
 
@@ -245,7 +245,34 @@ Total shutdown budget: 30 seconds. If exceeded, log at ERROR and force-exit non-
 
 ### reconnect duplication
 
-On reconnect, the relay replays events from the saved cursor. Some events may already be in the Redis stream. `redis_consumer_worker.py` deduplicates downstream. MAXLEN trimming handles stream size. Duplicates are transient and self-correct. No special handling in horizon-firehose is warranted; the behavior is documented as expected.
+On reconnect, the relay resumes from the saved cursor. Frames from the old connection that were still in the pipeline channels (up to ~3 k) are published first, so the new connection re-sends some seqs that are already in the stream. Since 2026-10-22 the replay guard below drops those before XADD; downstream consumers still deduplicate, so any duplicate that gets through is harmless.
+
+### every dial carries the current cursor (2026-10-22)
+
+**Incident (prism, 2026-10-22, and the same shape on 2026-10-16).** Two relays stalled at once. After 60 s the SDK's `per_recv_timeout` fired and `WebSocketKeepAlive` reconnected internally, re-dialling the URL it was built with. The supervisor had built that URL, with `?cursor=N`, at its *last* connect, 21 h and 27 h earlier. Each relay replayed that whole span (~32 M and ~36 M events) at ~8 k events/s, the sidecar XADDed all of it, and the shared stream (MAXLEN 1.5 M) overflowed, so the downstream consumer hit trim gaps every few minutes for over an hour.
+
+**Fix.** `run_one_connection` hands the SDK a `url_fn` (`WebSocketKeepAlive::with_url_fn`, which proto-blue-ws already provides) instead of a static URL. The SDK calls it on the initial dial and on every internal reconnect; it reads the publisher's current cursor and appends `?cursor=N`. So every reconnect, SDK-internal or supervisor-driven, resumes from the last confirmed XADD. Each dial logs `dialling relay` with the `connect_url`.
+
+Why not disable the SDK's internal reconnects (`max_reconnect_attempts = Some(0)`) and let the supervisor redial? With a zero budget the first stall surfaces as `ReconnectExhausted`, which the supervisor answers with `force_cooldown` — one stall would push a healthy primary into cooldown and fail over. Keeping the SDK's reconnects and fixing their URL leaves the backoff, reconnect budget and failover semantics exactly as before.
+
+Test: `ws_reader::tests::reconnect_after_stall_uses_latest_saved_cursor` (a silent mock relay records each handshake's query; the cursor advances between the first dial and the stall). It fails on the pre-fix code with two `cursor=100` dials.
+
+### replay guard (2026-10-22)
+
+Defence in depth behind the per-dial cursor. In the publisher, before XADD: an event whose `seq` is **at or below** the cursor already published for its relay is dropped, not XADDed.
+
+- **Per relay.** Seq numbering is per relay URL, and the comparison uses that relay's own cursor. A relay with no cursor yet (fresh start, live tip) is never guarded.
+- **Equal is dropped.** The cursor is the last XADDed (or skip-advanced) seq, so equal means already published.
+- **Race-free.** The publisher is the sole cursor writer (see "cursor ownership").
+- **Observability.** `replayed_events_dropped_total` (periodic: `replayed_events_dropped_in_window`; shutdown: `total_replayed_events_dropped`). One WARN `replay_drop_started` when a run of drops begins (relay, first dropped seq, cursor) and one INFO `replay_drop_ended` when the relay passes the cursor (count, first/last seq, duration).
+- **`#sync` skips** at or below the cursor were already no-ops (`Cursors::advance` is forward-only); a forward skip ends a drop run like a published event does.
+
+**Relay sequence reset.** A rebuilt relay that restarts its numbering sends *live* events with seqs below our cursor. Dropping those forever would be a silent outage. So if a drop run lasts `cursor.relay_reset_after_seconds` (default 600) with no event advancing that relay's cursor, the guard treats it as a reset, counts `relay_seq_resets_total`, and applies `on_stale_cursor` — the same knob that governs a relay rejecting our cursor:
+
+- `exit`: ERROR `policy_exit` with a reason naming the cursor key and the `redis-cli DEL` to run, sent through the decoder's policy-exit channel (`PolicyExit { task: "publisher", .. }`) with the global shutdown flipped. The publisher keeps draining (still dropping) so the normal cascade and final cursor flush run, then the process exits non-zero. On restart it resumes from the saved cursor; a relay that really reset produces the same drops and another exit every `relay_reset_after_seconds` — a visible crash loop, as with `OutdatedCursor`, until the operator deletes the key.
+- `live_tip`: WARN `relay_seq_reset`, `Cursors::rebase` moves the cursor back to just below the current seq, and publishing resumes from the relay's new numbering. Events dropped during the window are lost, which is what `live_tip` already means for a rejected cursor.
+
+A false positive needs a relay that ignores `?cursor=` and replays more than `relay_reset_after_seconds` of history. `exit` then restarts the process, which redials with the saved cursor; `live_tip` re-publishes the rest of that replay as duplicates. Both recover on their own; an endless silent drop would not.
 
 ---
 
@@ -375,6 +402,8 @@ Config allowlist for `startup_metrics`: only fields in this list are emitted. Ne
   "oversize_events_in_window": 0,
   "skipped_frames_in_window": 0,
   "unknown_frame_types_in_window": 0,
+  "replayed_events_dropped_in_window": 0,
+  "relay_seq_resets_in_window": 0,
   "active_relay": "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos",
   "channel_depths": {
     "ws_to_decoder": 0,
@@ -405,6 +434,8 @@ Config allowlist for `startup_metrics`: only fields in this list are emitted. Ne
   "total_decode_errors": 23,
   "total_redis_errors": 0,
   "total_reconnects": 17,
+  "total_replayed_events_dropped": 0,
+  "total_relay_seq_resets": 0,
   "final_cursor_per_relay": {
     "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos": "987654321"
   }
@@ -446,6 +477,7 @@ record_types = []
 save_interval_seconds = 5
 on_stale_cursor = "live_tip"        # or "exit"
 on_protocol_error = "reconnect_from_live_tip"  # or "exit"
+relay_reset_after_seconds = 600      # optional; see §3 "replay guard"
 
 [publisher]
 max_event_size_bytes = 1048576       # 1MB

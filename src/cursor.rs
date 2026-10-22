@@ -68,6 +68,22 @@ impl Cursors {
         entry.seq
     }
 
+    /// Set the cursor for `relay` to `seq` **even if that moves it
+    /// backwards**. The only caller is the publisher's replay guard
+    /// when it concludes a relay has reset its sequence and
+    /// `on_stale_cursor = "live_tip"` says to accept the relay's new
+    /// numbering (see `publisher::ReplayGuard`). Everything else uses
+    /// the forward-only [`advance`](Self::advance).
+    pub async fn rebase(&self, relay: &str, seq: u64) {
+        self.inner.write().await.insert(
+            relay.to_string(),
+            CursorState {
+                seq,
+                last_advanced_at: Instant::now(),
+            },
+        );
+    }
+
     /// Read the current cursor for `relay`. `None` if we've never seen
     /// (or loaded) a value for it.
     pub async fn get(&self, relay: &str) -> Option<u64> {
@@ -286,6 +302,15 @@ mod tests {
         // Stale sequence is ignored.
         assert_eq!(c.advance(R_A, 15).await, 20);
         assert_eq!(c.get(R_A).await, Some(20));
+    }
+
+    #[tokio::test]
+    async fn rebase_moves_backwards_then_advance_resumes() {
+        let c = Cursors::new();
+        c.advance(R_A, 1_000).await;
+        c.rebase(R_A, 9).await;
+        assert_eq!(c.get(R_A).await, Some(9));
+        assert_eq!(c.advance(R_A, 10).await, 10);
     }
 
     #[tokio::test]

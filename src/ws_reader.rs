@@ -34,6 +34,18 @@
 //! external wrapper needed. See
 //! <https://github.com/dollspace-gay/proto-blue/issues/3> — closed
 //! by upstream, integrated in horizon-firehose phase 8.6.
+//!
+//! # Every dial carries the current cursor (2026-10-22)
+//!
+//! The SDK's internal reconnects (after a `per_recv_timeout` stall or
+//! a reconnectable error) dial whatever URL the keep-alive was built
+//! with. Building `?cursor=N` once per supervisor connect therefore
+//! sent a stale cursor on every internal reconnect, and the relay
+//! replayed everything since. The URL is now produced per dial by the
+//! SDK's `url_fn` hook ([`connect_url_fn`]), so internal and
+//! supervisor reconnects both resume from the publisher's latest
+//! cursor. The SDK's reconnect budget and the supervisor's
+//! backoff / failover semantics are unchanged.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -488,10 +500,11 @@ pub fn spawn(cfg: RelayConfig, opts: WsReaderOptions) -> WsReader {
 /// that single watch. The Phase 6 [`Metrics`] accumulates reconnect
 /// counts and history.
 ///
-/// `cursors` is shared with the publisher. On each connect/reconnect,
-/// the supervisor reads the current cursor for the chosen relay and
-/// appends `?cursor=N` so the relay resumes from our last-confirmed
-/// XADD.
+/// `cursors` is shared with the publisher. On every dial — supervisor
+/// connects and the SDK's internal reconnects alike — the current
+/// cursor for the chosen relay is read and appended as `?cursor=N` so
+/// the relay resumes from our last-confirmed XADD (see
+/// [`connect_url_fn`]).
 pub fn spawn_with_cursors(
     cfg: RelayConfig,
     opts: WsReaderOptions,
@@ -598,18 +611,12 @@ async fn supervisor(
             }
         }
 
-        // Read the saved cursor (if any) for this relay and build the
-        // connection URL with a `?cursor=N` query param so the relay
-        // resumes from our last-confirmed position. Cursors are shared
-        // with the publisher, which advances them on XADD success —
-        // so any reconnect mid-stream picks up the latest.
-        let connect_url = match cursors.get(&url).await {
-            Some(seq) => format!("{}{}cursor={seq}", url, url_separator(&url)),
-            None => url.clone(),
-        };
-
+        // The connection URL (with `?cursor=N` from the saved cursor)
+        // is built per dial inside `run_one_connection`, through the
+        // SDK's `url_fn` hook — see `connect_url_fn` for why that
+        // must happen on *every* dial, not once here.
         let outcome = run_one_connection(
-            &connect_url,
+            &cursors,
             &url,
             &opts,
             &state,
@@ -721,13 +728,56 @@ enum ConnectionOutcome {
     ForcedReconnect,
 }
 
-/// Drive one WebSocket connection attempt. `connect_url` may include
-/// a `?cursor=N` resume param (the WebSocket client sees this);
-/// `relay_label` is the canonical URL used for cursor lookups, log
-/// fields, and per-frame stamping.
+/// Build the URL for one dial: the relay URL plus `?cursor=N` from
+/// the *current* saved cursor, or the bare URL when there is none
+/// (resume from live tip, DESIGN.md §3).
+pub(crate) async fn build_connect_url(cursors: &Cursors, relay: &str) -> String {
+    match cursors.get(relay).await {
+        Some(seq) => format!("{relay}{}cursor={seq}", url_separator(relay)),
+        None => relay.to_string(),
+    }
+}
+
+/// The SDK `url_fn` for one connection: called by
+/// `WebSocketKeepAlive` on the initial dial **and on every internal
+/// reconnect** (a `per_recv_timeout` stall, a reconnectable transport
+/// error).
+///
+/// 2026-10-22 replay fix: before this, the supervisor built the
+/// `?cursor=N` URL once per `run_one_connection` and handed it to the
+/// SDK as a static URL. The SDK's internal reconnect re-dialled that
+/// same URL, so after a 60 s stall the relay was asked for the cursor
+/// from the supervisor's *last* connect — up to a day old — and
+/// replayed everything since (prism: ~32 M events from bsky, ~36 M
+/// from blacksky, at ~8 k/s each). Resolving the URL per dial makes
+/// every reconnect, internal or supervisor-driven, resume from the
+/// cursor the publisher last confirmed.
+fn connect_url_fn(cursors: Cursors, relay: String) -> proto_blue_ws::keepalive::UrlFn {
+    Arc::new(move || {
+        let cursors = cursors.clone();
+        let relay = relay.clone();
+        Box::pin(async move {
+            let url = build_connect_url(&cursors, &relay).await;
+            // Both components are userinfo-free (config.rs rejects
+            // userinfo-bearing relay URLs; the cursor is numeric).
+            // Sanitizer is defense-in-depth per Phase 8.5 finding 4.4.
+            info!(
+                relay = %crate::config::sanitize_ws_url(&relay),
+                connect_url = %crate::config::sanitize_ws_url(&url),
+                "dialling relay"
+            );
+            url
+        })
+    })
+}
+
+/// Drive one WebSocket connection attempt. The URL for each dial
+/// (initial and SDK-internal reconnects) is rebuilt from `cursors` by
+/// [`connect_url_fn`]; `relay_label` is the canonical URL used for
+/// cursor lookups, log fields, and per-frame stamping.
 #[allow(clippy::too_many_arguments)]
 async fn run_one_connection(
-    connect_url: &str,
+    cursors: &Cursors,
     relay_label: &str,
     opts: &WsReaderOptions,
     state: &Arc<Mutex<SharedState>>,
@@ -739,19 +789,15 @@ async fn run_one_connection(
     force_reconnect_rx: &mut watch::Receiver<u64>,
     connector: Arc<dyn WebSocketConnector>,
 ) -> ConnectionOutcome {
-    // `connect_url` is `relay_label + ?cursor=N` — both components are
-    // userinfo-free (validator rejects userinfo-bearing relay URLs in
-    // config.rs, and the cursor is a numeric seq), so the log output
-    // carries no credentials. Sanitizer here is defense-in-depth per
-    // Phase 8.5 review finding 4.4.
     info!(
         relay = %crate::config::sanitize_ws_url(relay_label),
-        connect_url = %crate::config::sanitize_ws_url(connect_url),
         "connecting to relay"
     );
 
+    // The static URL is only the SDK's fallback; `with_url_fn` below
+    // takes precedence on every dial, including the first.
     let mut ws = WebSocketKeepAlive::with_connector(
-        connect_url,
+        relay_label,
         WebSocketKeepAliveOpts {
             max_reconnect_seconds: inner_max_secs,
             heartbeat_interval_ms: opts.heartbeat_interval_ms,
@@ -770,7 +816,8 @@ async fn run_one_connection(
         // `TungsteniteConnector` and TLS goes through native-tls
         // unchanged.
         connector,
-    );
+    )
+    .with_url_fn(connect_url_fn(cursors.clone(), relay_label.to_string()));
 
     let connect_res = tokio::select! {
         biased;
@@ -1572,6 +1619,114 @@ mod tests {
 
         reader.shutdown().await;
         fallback.shutdown().await;
+    }
+
+    // ─── 2026-10-22 replay fix: every dial carries the current cursor ──
+
+    /// Mock relay that records the request URI (path + query) of every
+    /// WebSocket handshake, then holds the connection open without
+    /// sending anything — a stalled relay.
+    async fn start_recording_silent_mock() -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Real relay URLs carry the XRPC path; the cursor query goes
+        // after it.
+        let url = format!(
+            "ws://{}/xrpc/com.atproto.sync.subscribeRepos",
+            listener.local_addr().unwrap()
+        );
+        let uris = Arc::new(Mutex::new(Vec::new()));
+        let uris_c = uris.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let uris = uris_c.clone();
+                tokio::spawn(async move {
+                    let cb = |req: &Request, resp: Response| {
+                        uris.lock().unwrap().push(req.uri().to_string());
+                        Ok(resp)
+                    };
+                    let Ok(mut ws) = accept_hdr_async(stream, cb).await else {
+                        return;
+                    };
+                    while ws.next().await.is_some() {}
+                });
+            }
+        });
+        (url, uris, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_after_stall_uses_latest_saved_cursor() {
+        // The prism incident: the SDK's internal reconnect after a
+        // `per_recv_timeout` stall re-dialled the URL built at the
+        // supervisor's last connect, with a day-old cursor. Here the
+        // cursor advances between the first dial and the stall; the
+        // reconnect must ask for the advanced cursor.
+        let (url, uris, task) = start_recording_silent_mock().await;
+        let cursors = Cursors::new();
+        cursors.advance(&url, 100).await;
+
+        let opts = WsReaderOptions {
+            per_recv_timeout: Duration::from_millis(300),
+            ..test_options()
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let reader = spawn_internal(
+            relay_cfg(&url, &[]),
+            opts,
+            cursors.clone(),
+            shutdown_rx,
+            Some(shutdown_tx),
+            Arc::new(Metrics::default()),
+        );
+
+        // Wait for the first handshake, then advance the cursor as the
+        // publisher would after XADDing events from that connection.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while uris.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "first dial never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cursors.advance(&url, 500).await;
+
+        // The silent relay trips `per_recv_timeout`; wait for the
+        // reconnect's handshake.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while uris.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline, "reconnect never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        reader.shutdown().await;
+        task.abort();
+
+        let seen = uris.lock().unwrap().clone();
+        assert_eq!(
+            seen[0], "/xrpc/com.atproto.sync.subscribeRepos?cursor=100",
+            "first dial: {seen:?}"
+        );
+        assert_eq!(
+            seen[1], "/xrpc/com.atproto.sync.subscribeRepos?cursor=500",
+            "the reconnect after a stall must carry the cursor saved at \
+             reconnect time, not the one from the first dial: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_connect_url_appends_current_cursor() {
+        let c = Cursors::new();
+        assert_eq!(build_connect_url(&c, "wss://r/x").await, "wss://r/x");
+        c.advance("wss://r/x", 7).await;
+        assert_eq!(
+            build_connect_url(&c, "wss://r/x").await,
+            "wss://r/x?cursor=7"
+        );
+        c.advance("wss://r/y?a=1", 9).await;
+        assert_eq!(
+            build_connect_url(&c, "wss://r/y?a=1").await,
+            "wss://r/y?a=1&cursor=9"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

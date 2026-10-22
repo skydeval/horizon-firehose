@@ -182,6 +182,8 @@ Verify the relay URL is correct and includes the XRPC path (`/xrpc/com.atproto.s
 **Cursor stuck or resetting.**
 Check the `cursor_ages_seconds` field in `periodic_metrics` logs. A large age means the cursor isn't advancing. Most common cause: the service is reconnecting repeatedly. Check `relay_reconnects_in_window` in the same log line.
 
+If `replayed_events_dropped_in_window` is also high, the relay is sending events at or below the published cursor. They are dropped, not XADDed. A few thousand right after a reconnect is normal: frames from the old connection that were still in the pipeline overlap with the new connection's resume. A sustained rate means the relay is replaying history; look for `replay_drop_started` / `replay_drop_ended` log lines. If the drops last `cursor.relay_reset_after_seconds` (default 600) with no advance, a `relay_seq_reset` (under `live_tip`) or `policy_exit` (under `exit`) line follows and `relay_seq_resets_in_window` counts it. Under `exit`, a relay that really reset its sequence makes the service exit every `relay_reset_after_seconds`; the exit reason names the cursor key to `DEL` to resume from the relay's live tip.
+
 **Image build fails with Rust compile errors.**
 Ensure your Docker builder has enough memory (~4GB recommended for LTO build). Verify your Cargo.lock matches the pinned proto-blue SHA; if not, `cargo update` before building.
 

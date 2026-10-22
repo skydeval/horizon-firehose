@@ -104,6 +104,18 @@ pub struct CursorConfig {
     pub save_interval_seconds: u64,
     pub on_stale_cursor: StaleCursorPolicy,
     pub on_protocol_error: ProtocolErrorPolicy,
+    /// Replay guard (2026-10-22): the publisher drops events whose seq
+    /// is at or below the cursor already published for their relay.
+    /// If those drops run this long with no event advancing the
+    /// cursor, the relay is treated as having reset its sequence and
+    /// `on_stale_cursor` applies (`exit`: policy exit; `live_tip`:
+    /// accept the relay's new numbering). Optional; default 600.
+    #[serde(default = "default_relay_reset_after_seconds")]
+    pub relay_reset_after_seconds: u64,
+}
+
+fn default_relay_reset_after_seconds() -> u64 {
+    600
 }
 
 impl Default for CursorConfig {
@@ -112,6 +124,7 @@ impl Default for CursorConfig {
             save_interval_seconds: 5,
             on_stale_cursor: StaleCursorPolicy::LiveTip,
             on_protocol_error: ProtocolErrorPolicy::ReconnectFromLiveTip,
+            relay_reset_after_seconds: default_relay_reset_after_seconds(),
         }
     }
 }
@@ -253,6 +266,11 @@ impl Config {
         if self.cursor.save_interval_seconds == 0 {
             return Err(Error::ConfigValidation(
                 "cursor.save_interval_seconds must be > 0".into(),
+            ));
+        }
+        if self.cursor.relay_reset_after_seconds == 0 {
+            return Err(Error::ConfigValidation(
+                "cursor.relay_reset_after_seconds must be > 0".into(),
             ));
         }
 
@@ -421,6 +439,8 @@ format = "json"
             assert_eq!(cfg.relay.url, "wss://bsky.network");
             assert_eq!(cfg.redis.stream_key, "firehose:events");
             assert_eq!(cfg.cursor.on_stale_cursor, StaleCursorPolicy::LiveTip);
+            // Optional key, absent from MINIMAL_CONFIG → default.
+            assert_eq!(cfg.cursor.relay_reset_after_seconds, 600);
             assert_eq!(cfg.publisher.on_oversize, OversizePolicy::SkipWithLog);
             assert_eq!(cfg.logging.format, LogFormat::Json);
             Ok(())

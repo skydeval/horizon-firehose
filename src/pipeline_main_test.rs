@@ -110,6 +110,9 @@ fn test_publisher_opts() -> PublisherOptions {
         retry_initial: Duration::from_millis(10),
         retry_max: Duration::from_millis(50),
         retry_warn_interval: Duration::from_millis(200),
+        relay_reset_after: Duration::from_secs(600),
+        on_stale_cursor: crate::config::StaleCursorPolicy::LiveTip,
+        policy_exit: None,
     }
 }
 
@@ -562,6 +565,8 @@ async fn periodic_metrics_emits_with_expected_fields() {
         "unknown_type_count_in_window",
         "oversize_events_in_window",
         "skipped_frames_in_window",
+        "replayed_events_dropped_in_window",
+        "relay_seq_resets_in_window",
         "channel_depths",
         "cursor_ages_seconds",
         "oldest_event_age_seconds",
@@ -1038,6 +1043,7 @@ fn cfg_with_tls(tls: &str) -> crate::config::Config {
             save_interval_seconds: 5,
             on_stale_cursor: StaleCursorPolicy::LiveTip,
             on_protocol_error: ProtocolErrorPolicy::ReconnectFromLiveTip,
+            relay_reset_after_seconds: 600,
         },
         publisher: PublisherConfig {
             max_event_size_bytes: 1_048_576,
@@ -1200,6 +1206,7 @@ async fn startup_metrics_only_emits_allowlisted_fields_no_credentials() {
             save_interval_seconds: 5,
             on_stale_cursor: StaleCursorPolicy::LiveTip,
             on_protocol_error: ProtocolErrorPolicy::ReconnectFromLiveTip,
+            relay_reset_after_seconds: 600,
         },
         publisher: PublisherConfig {
             max_event_size_bytes: 1_048_576,

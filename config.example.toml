@@ -72,6 +72,16 @@ on_stale_cursor = "live_tip"
 # "reconnect_from_live_tip" — drop cursor, reconnect at live tip.
 # "exit"                    — exit non-zero.
 on_protocol_error = "reconnect_from_live_tip"
+# Replay guard. The publisher never XADDs an event whose seq is at or
+# below the cursor already published for its relay (counted as
+# replayed_events_dropped). If such drops continue this many seconds
+# with no event advancing the cursor, the relay is treated as having
+# reset its sequence and on_stale_cursor applies:
+# "live_tip" — accept the relay's new numbering (cursor moves back;
+#              events dropped during the window are lost).
+# "exit"     — exit non-zero; to recover, DEL the relay's cursor key.
+# Optional; default 600.
+relay_reset_after_seconds = 600
 
 [publisher]
 max_event_size_bytes = 1048576    # 1 MiB

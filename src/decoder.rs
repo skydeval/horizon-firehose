@@ -72,6 +72,7 @@ impl DecoderPolicies {
         match self.on_stale_cursor {
             StaleCursorPolicy::LiveTip => PolicyAction::Continue,
             StaleCursorPolicy::Exit => PolicyAction::Exit(PolicyExit {
+                task: "decoder",
                 reason: format!(
                     "on_stale_cursor=exit after OutdatedCursor from {relay}: message={message:?}"
                 ),
@@ -90,6 +91,7 @@ impl DecoderPolicies {
         match self.on_protocol_error {
             ProtocolErrorPolicy::ReconnectFromLiveTip => PolicyAction::Continue,
             ProtocolErrorPolicy::Exit => PolicyAction::Exit(PolicyExit {
+                task: "decoder",
                 reason: format!(
                     "on_protocol_error=exit after info frame `{name}` from {relay}: \
                      message={message:?}"
@@ -117,6 +119,9 @@ pub(crate) enum PolicyAction {
 /// silently continue running.
 #[derive(Debug, Clone)]
 pub struct PolicyExit {
+    /// Pipeline task that raised the exit (`"decoder"` or
+    /// `"publisher"`), for the process's final error attribution.
+    pub task: &'static str,
     /// Human-readable description (e.g.
     /// `"on_stale_cursor=exit after OutdatedCursor from wss://…"`).
     pub reason: String,
@@ -1609,7 +1614,7 @@ mod tests {
             ProtocolErrorPolicy::ReconnectFromLiveTip,
         );
         match p.outdated_cursor_action("wss://bsky.network", Some("cursor is too old")) {
-            PolicyAction::Exit(PolicyExit { reason }) => {
+            PolicyAction::Exit(PolicyExit { reason, .. }) => {
                 assert!(
                     reason.contains("on_stale_cursor=exit"),
                     "reason must name the tripping policy: {reason}"
@@ -1647,7 +1652,7 @@ mod tests {
             "ServerOverloaded",
             Some("retry later"),
         ) {
-            PolicyAction::Exit(PolicyExit { reason }) => {
+            PolicyAction::Exit(PolicyExit { reason, .. }) => {
                 assert!(
                     reason.contains("on_protocol_error=exit"),
                     "reason must name the tripping policy: {reason}"

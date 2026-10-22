@@ -587,7 +587,10 @@ async fn run_async(
     // Phase 10.5 finding 5.1: the decoder consults
     // `cursor.on_stale_cursor` and `cursor.on_protocol_error`. When
     // a policy of `Exit` fires, the decoder pushes a reason onto
-    // this channel and flips the global shutdown. We observe the
+    // this channel and flips the global shutdown. The publisher's
+    // replay guard (2026-10-22) uses the same channel when it
+    // concludes a relay reset its sequence under
+    // `on_stale_cursor = "exit"`. We observe the
     // channel *after* the shutdown cascade so the process exits
     // non-zero with clear attribution, instead of the misleading
     // "decoder exited unexpectedly" the coordinator would otherwise log.
@@ -600,7 +603,7 @@ async fn run_async(
         ws_control,
         decoder::DecoderPolicies::from_cursor_config(&cfg.cursor),
         shutdown_tx.clone(),
-        policy_exit_tx,
+        policy_exit_tx.clone(),
     );
 
     let mut router_handle = router::spawn(
@@ -614,12 +617,23 @@ async fn run_async(
     let mut publisher_handle = publisher::spawn(
         backend.clone(),
         cursors.clone(),
-        publisher::PublisherOptions::with_defaults(
-            cfg.redis.stream_key.clone(),
-            cfg.redis.max_stream_len,
-            cfg.publisher.max_event_size_bytes,
-            cfg.publisher.on_oversize,
-        ),
+        publisher::PublisherOptions {
+            // 2026-10-22 replay guard: seq ≤ published cursor is
+            // dropped; a run of drops this long is treated as a relay
+            // sequence reset and handled per `on_stale_cursor`.
+            relay_reset_after: Duration::from_secs(cfg.cursor.relay_reset_after_seconds),
+            on_stale_cursor: cfg.cursor.on_stale_cursor,
+            policy_exit: Some(publisher::PolicyExitSink {
+                policy_exit_tx,
+                shutdown_tx: shutdown_tx.clone(),
+            }),
+            ..publisher::PublisherOptions::with_defaults(
+                cfg.redis.stream_key.clone(),
+                cfg.redis.max_stream_len,
+                cfg.publisher.max_event_size_bytes,
+                cfg.publisher.on_oversize,
+            )
+        },
         filtered_rx,
         metrics.clone(),
     );
@@ -765,6 +779,8 @@ async fn run_async(
         total_skipped_frames = totals.total_skipped_frames,
         total_oversize_events = totals.total_oversize_events,
         total_unknown_frame_types = totals.total_unknown_frame_types,
+        total_replayed_events_dropped = totals.total_replayed_events_dropped,
+        total_relay_seq_resets = totals.total_relay_seq_resets,
         publisher_task_panicked = publisher_panicked,
         final_cursor_per_relay = %serde_json::to_string(&final_cursor_per_relay).unwrap_or_default(),
         "shutdown complete"
@@ -778,7 +794,7 @@ async fn run_async(
     // orchestrator sees the operator's intent.
     if let Ok(policy_exit) = policy_exit_rx.try_recv() {
         return Err(Error::TaskFailure {
-            task: "decoder",
+            task: policy_exit.task,
             message: format!("policy-driven exit: {}", policy_exit.reason),
         });
     }

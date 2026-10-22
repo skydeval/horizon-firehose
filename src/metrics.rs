@@ -101,6 +101,18 @@ pub struct Metrics {
     /// sustained increase.
     pub decoder_circuit_opens_total: AtomicU64,
 
+    /// 2026-10-22 replay guard: events the publisher did **not** XADD
+    /// because their seq was at or below the cursor already published
+    /// for their relay — a relay replaying history we already sent
+    /// downstream. A non-zero rate outside a brief reconnect overlap
+    /// means a relay is ignoring or misreading our `?cursor=`.
+    pub replayed_events_dropped_total: AtomicU64,
+
+    /// Times the replay guard concluded a relay had reset its
+    /// sequence (drops ran for `cursor.relay_reset_after_seconds`
+    /// with no advance) and applied `on_stale_cursor`.
+    pub relay_seq_resets_total: AtomicU64,
+
     /// Rolling reconnect history (for the `reconnects_last_hour`
     /// gauge) owned by the metrics struct. Written by ws_reader on
     /// each reconnect, read by the emitter on each tick. Capped at
@@ -152,6 +164,8 @@ impl Metrics {
             skipped_frames: self.skipped_frames_total.load(Ordering::Relaxed),
             unknown_frame_types: self.unknown_frame_types_total.load(Ordering::Relaxed),
             reconnects: self.reconnects_total.load(Ordering::Relaxed),
+            replayed_dropped: self.replayed_events_dropped_total.load(Ordering::Relaxed),
+            relay_seq_resets: self.relay_seq_resets_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -167,6 +181,8 @@ struct CumulativeSnapshot {
     skipped_frames: u64,
     unknown_frame_types: u64,
     reconnects: u64,
+    replayed_dropped: u64,
+    relay_seq_resets: u64,
 }
 
 impl CumulativeSnapshot {
@@ -185,6 +201,8 @@ impl CumulativeSnapshot {
                 .unknown_frame_types
                 .saturating_sub(prev.unknown_frame_types),
             reconnects: self.reconnects.saturating_sub(prev.reconnects),
+            replayed_dropped: self.replayed_dropped.saturating_sub(prev.replayed_dropped),
+            relay_seq_resets: self.relay_seq_resets.saturating_sub(prev.relay_seq_resets),
         }
     }
 }
@@ -330,6 +348,8 @@ pub fn spawn_emitter<B: StreamBackend>(
                         oversize_events_in_window = delta.oversize_events,
                         skipped_frames_in_window = delta.skipped_frames,
                         unknown_frame_types_in_window = delta.unknown_frame_types,
+                        replayed_events_dropped_in_window = delta.replayed_dropped,
+                        relay_seq_resets_in_window = delta.relay_seq_resets,
                         active_relay = ws_snapshot.active_relay.as_deref().unwrap_or(""),
                         channel_depths = %serde_json::to_string(&depths).unwrap_or_default(),
                         cursor_ages_seconds = %serde_json::to_string(&cursor_ages).unwrap_or_default(),
@@ -360,6 +380,8 @@ pub struct ShutdownTotals {
     pub total_skipped_frames: u64,
     pub total_oversize_events: u64,
     pub total_unknown_frame_types: u64,
+    pub total_replayed_events_dropped: u64,
+    pub total_relay_seq_resets: u64,
 }
 
 impl Metrics {
@@ -373,6 +395,8 @@ impl Metrics {
             total_skipped_frames: s.skipped_frames,
             total_oversize_events: s.oversize_events,
             total_unknown_frame_types: s.unknown_frame_types,
+            total_replayed_events_dropped: s.replayed_dropped,
+            total_relay_seq_resets: s.relay_seq_resets,
         }
     }
 }
