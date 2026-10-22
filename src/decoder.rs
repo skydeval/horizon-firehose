@@ -356,6 +356,12 @@ fn decode_commit(
     let repo = map_str(body, "repo")?.to_string();
     let commit_cid = map_cid(body, "commit")?.to_string();
     let rev = map_str(body, "rev")?.to_string();
+    // `since` is informational for consumers: a missing or non-string
+    // value becomes null rather than failing the whole commit.
+    let since = match body.get("since") {
+        Some(LexValue::String(s)) => Some(s.clone()),
+        _ => None,
+    };
     let time = map_str(body, "time")?.to_string();
     let blocks_bytes = map_bytes(body, "blocks")?;
     let ops_arr = map_array(body, "ops")?;
@@ -418,6 +424,7 @@ fn decode_commit(
             repo,
             commit: commit_cid,
             rev,
+            since,
             ops,
             time,
             relay: relay.into(),
@@ -1584,6 +1591,112 @@ mod tests {
             DecodedFrame::Info { .. } => "info",
             DecodedFrame::Skipped { .. } => "skipped",
         }
+    }
+
+    // ─── `since` pass-through ──────────────────────────────────────
+
+    /// Bodies of every committed curated `#commit` frame, as the
+    /// decoder sees them (header and body maps).
+    fn curated_commit_bodies() -> Vec<(String, BTreeMap<String, LexValue>)> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/fixtures");
+        let mut paths: Vec<std::path::PathBuf> = fs::read_dir(&dir)
+            .expect("tests/golden/fixtures is committed")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("bin"))
+            .collect();
+        paths.sort();
+        let mut out = Vec::new();
+        for path in paths {
+            let bytes = fs::read(&path).unwrap();
+            let values = decode_all(&bytes).unwrap();
+            let header = expect_map(&values[0], "header").unwrap();
+            if map_str(header, "t").ok() != Some("#commit") {
+                continue;
+            }
+            let body = expect_map(&values[1], "body").unwrap().clone();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            out.push((name, body));
+        }
+        out
+    }
+
+    fn decoded_since(body: &BTreeMap<String, LexValue>) -> Option<String> {
+        match decode_commit(body, "ws://t").expect("commit decodes") {
+            DecodedFrame::Event {
+                event: Event::Commit(c),
+                ..
+            } => c.since,
+            other => panic!("expected a commit event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_carries_the_frames_since() {
+        let bodies = curated_commit_bodies();
+        let mut with_string = 0;
+        for (name, body) in &bodies {
+            let want = match body.get("since") {
+                Some(LexValue::String(s)) => {
+                    with_string += 1;
+                    Some(s.clone())
+                }
+                _ => None,
+            };
+            assert_eq!(decoded_since(body), want, "{name}");
+        }
+        assert!(
+            with_string > 0,
+            "no curated commit frame carries a string `since`; the test proves nothing"
+        );
+    }
+
+    #[test]
+    fn commit_since_null_absent_or_malformed_is_null_and_the_commit_still_decodes() {
+        let bodies = curated_commit_bodies();
+        let (_, base) = bodies
+            .iter()
+            .find(|(_, b)| matches!(b.get("since"), Some(LexValue::String(_))))
+            .expect("a curated commit frame with a string `since`");
+        assert!(decoded_since(base).is_some());
+
+        let mut null = base.clone();
+        null.insert("since".into(), LexValue::Null);
+        assert_eq!(decoded_since(&null), None);
+
+        let mut absent = base.clone();
+        absent.remove("since");
+        assert_eq!(decoded_since(&absent), None);
+
+        let mut malformed = base.clone();
+        malformed.insert("since".into(), LexValue::Integer(7));
+        assert_eq!(decoded_since(&malformed), None);
+    }
+
+    #[test]
+    fn commit_since_serialises_as_string_or_explicit_null() {
+        let bodies = curated_commit_bodies();
+        let (_, base) = bodies
+            .iter()
+            .find(|(_, b)| matches!(b.get("since"), Some(LexValue::String(_))))
+            .expect("a curated commit frame with a string `since`");
+        let Some(LexValue::String(want)) = base.get("since") else {
+            unreachable!()
+        };
+        let DecodedFrame::Event { event, .. } = decode_commit(base, "ws://t").unwrap() else {
+            panic!("expected an event")
+        };
+        let v: serde_json::Value = serde_json::from_slice(&event.to_json_bytes().unwrap()).unwrap();
+        assert_eq!(v["since"], serde_json::Value::String(want.clone()));
+
+        let mut absent = base.clone();
+        absent.remove("since");
+        let DecodedFrame::Event { event, .. } = decode_commit(&absent, "ws://t").unwrap() else {
+            panic!("expected an event")
+        };
+        let v: serde_json::Value = serde_json::from_slice(&event.to_json_bytes().unwrap()).unwrap();
+        assert!(v.as_object().unwrap().contains_key("since"));
+        assert!(v["since"].is_null());
     }
 
     // ─── Phase 10.5 finding 5.1: policy-dispatch unit tests ───────────

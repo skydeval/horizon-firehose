@@ -755,6 +755,7 @@ mod tests {
             repo: format!("did:plc:{seq_hint}"),
             commit: "bafycommit".into(),
             rev: "3k2la".into(),
+            since: None,
             ops: vec![Operation {
                 action: "create".into(),
                 path: "app.bsky.feed.post/abc".into(),

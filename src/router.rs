@@ -199,6 +199,7 @@ mod tests {
             repo: "did:plc:abc".into(),
             commit: "bafycommit".into(),
             rev: "3k2la".into(),
+            since: None,
             ops,
             time: "2026-04-19T00:00:00.000Z".into(),
             relay: "ws://test".into(),

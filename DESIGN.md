@@ -298,6 +298,7 @@ commit_event := {
   "repo": string,              // DID, e.g. "did:plc:..."
   "commit": string,            // CID in its transmitted form (CIDv0 or CIDv1)
   "rev": string,               // TID, e.g. "3k2la..."
+  "since": string | null,      // the frame's `since`: rev of the repo's previous commit; null when absent or not a string
   "ops": [operation],
   "time": string,              // ISO 8601 UTC with ms precision, e.g. "2026-04-18T12:34:56.789Z"
   "_relay": string              // always emitted; the relay URL this event came from

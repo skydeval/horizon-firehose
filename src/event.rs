@@ -67,6 +67,11 @@ pub struct CommitEvent {
     pub repo: String,
     pub commit: String,
     pub rev: String,
+    /// The `#commit` frame's `since`: the rev of the repo's previous
+    /// commit, or null (the repo's first commit, or a frame that did
+    /// not carry a string). Consumers use it to tell whether they have
+    /// seen every commit of a repo in sequence.
+    pub since: Option<String>,
     pub ops: Vec<Operation>,
     pub time: String,
     #[serde(rename = "_relay")]
@@ -124,6 +129,7 @@ mod tests {
             repo: "did:plc:abc".into(),
             commit: "bafy".into(),
             rev: "3kxxx".into(),
+            since: Some("3kwww".into()),
             ops: vec![Operation {
                 action: "create".into(),
                 path: "app.bsky.feed.post/abc".into(),
@@ -135,6 +141,7 @@ mod tests {
         });
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["repo"], "did:plc:abc");
+        assert_eq!(v["since"], "3kwww");
         assert_eq!(v["_relay"], "ws://relay.test");
         assert_eq!(v["ops"][0]["record"]["text"], "hello");
         assert_eq!(ev.type_name(), "commit");
