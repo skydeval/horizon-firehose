@@ -21,8 +21,9 @@
 # stripped horizon-firehose binary (~15–20 MB with both rustls and
 # native-tls compiled in) and the distroless base (~25 MB).
 #
-# Build:
-#   docker build -t horizon-firehose:local .
+# Build with this folder as the context:
+#   docker build -t horizon-firehose:local .                  (from here)
+#   docker build -t horizon-firehose:local horizon-firehose   (from the repo root)
 #
 # Run (mount config into /app/config.toml):
 #   docker run --rm \

@@ -19,7 +19,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 EXPECTED_FILE="$SCRIPT_DIR/expected-proto-blue-sha.txt"
-CARGO_LOCK="$REPO_ROOT/Cargo.lock"
+CARGO_LOCK="$REPO_ROOT/horizon-firehose/Cargo.lock"
 
 if [[ ! -r "$EXPECTED_FILE" ]]; then
     echo "error: $EXPECTED_FILE is not readable" >&2

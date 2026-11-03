@@ -1,0 +1,27 @@
+# Exclude everything the Docker build context doesn't need. The context
+# is this crate folder; the Dockerfile only copies Cargo.toml,
+# Cargo.lock and src/.
+
+# Local build artefacts (can be multi-GB; the container does its
+# own `cargo build` from a clean state).
+target/
+**/target/
+
+# Test fixtures + captured frames (8 MB+ and `cargo build --bin
+# horizon-firehose` never touches them).
+tests/
+
+# Cargo config override (was a rustc-ICE workaround; removed from
+# main but keep ignored in case it returns as a local-only shim).
+.cargo/
+
+# Local config and environment files can hold credentials.
+config.toml
+.env
+.env.*
+*.env
+
+# Docker artefacts themselves and reference material.
+Dockerfile
+.dockerignore
+examples/

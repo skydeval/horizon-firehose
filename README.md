@@ -4,19 +4,26 @@
 
 A Rust-based ATProto firehose consumer with CBOR/CAR decoding, per-relay failover, and Redis stream publishing.
 
-**Status**: Deployed in parallel-run alongside the existing Python firehose consumer. See DESIGN.md for architecture, DEPLOYMENT.md for operational details, and RETROSPECTIVE.md for the story of building it.
+**Status**: Deployed in parallel-run alongside the existing Python firehose consumer.
+
+## Documentation
+
+- [Deployment](docs/deployment.md): config, running, cursors, metrics, troubleshooting
+- [Design](docs/design/README.md): architecture, cursor and relay handling, event format, hardening, review history
+- [Retrospective](docs/retrospective/README.md): the story of building it
+- [Changelog](CHANGELOG.md)
 
 ## Running with Docker
 
-The [Dockerfile](Dockerfile) produces a production image on `gcr.io/distroless/cc-debian12:nonroot`: no shell, no package manager, runs as non-root (UID 65532) by default. CI gates the image at ≤ 50 MiB on every push.
+The [Dockerfile](horizon-firehose/Dockerfile) produces a production image on `gcr.io/distroless/cc-debian12:nonroot`: no shell, no package manager, runs as non-root (UID 65532) by default. CI gates the image at ≤ 50 MiB on every push.
 
 ### Build
 
 ```sh
-docker build -t horizon-firehose:local .
+docker build -t horizon-firehose:local horizon-firehose
 ```
 
-The build is two-stage. The `rust:1.85-bookworm` builder stage produces a release binary with LTO + strip (both already set in `[profile.release]`). The distroless runtime stage carries only glibc + libssl3 (needed for native-tls, the default TLS path) plus the binary.
+Everything needed to build and run it lives in [horizon-firehose/](horizon-firehose/), which is also the Docker build context. The build is two-stage. The `rust:1.95-bookworm` builder stage produces a release binary with LTO + strip (both already set in `[profile.release]`). The distroless runtime stage carries only glibc + libssl3 (needed for native-tls, the default TLS path) plus the binary.
 
 ### Run
 
@@ -28,7 +35,7 @@ docker run --rm \
     horizon-firehose:local
 ```
 
-Override individual fields with the `HORIZON_FIREHOSE_*` env-var schema (see [config.example.toml](config.example.toml) for the full list). Common overrides:
+Override individual fields with the `HORIZON_FIREHOSE_*` env-var schema (see [config.example.toml](horizon-firehose/config.example.toml) for the full list). Common overrides:
 
 ```sh
 docker run --rm \
@@ -38,21 +45,21 @@ docker run --rm \
     horizon-firehose:local
 ```
 
-On startup you'll see a single `startup_metrics` JSON line listing the resolved relay, fallbacks, Redis host, and whether `tls_extra_ca_file` loaded (see DESIGN.md §3 "TLS verification"). After that the binary idles on the firehose and emits one log line per reconnect / filter drop / XADD batch.
+On startup you'll see a single `startup_metrics` JSON line listing the resolved relay, fallbacks, Redis host, and whether `tls_extra_ca_file` loaded (see [hardening](docs/design/hardening.md#tls)). After that the binary idles on the firehose and emits one log line per reconnect / filter drop / XADD batch.
 
 ### Shutdown
 
-`SIGTERM` and `SIGINT` drive the DESIGN.md §3 cascade with a 30 s total budget (WebSocket → decoder → publisher → cursor flush). Docker's default `docker stop` sends SIGTERM and waits 10 s before escalating to SIGKILL — bump the grace period with `--time 35` if you want the full budget:
+`SIGTERM` and `SIGINT` drive the [shutdown cascade](docs/design/architecture.md#shutdown) with a 30 s total budget (WebSocket → decoder → publisher → cursor flush). Docker's default `docker stop` sends SIGTERM and waits 10 s before escalating to SIGKILL — bump the grace period with `--time 35` if you want the full budget:
 
 ```sh
 docker stop --time 35 <container>
 ```
 
-The included [examples/docker-compose.yml](examples/docker-compose.yml) sets `stop_grace_period: 35s` for the same reason.
+The included [examples/docker-compose.yml](horizon-firehose/examples/docker-compose.yml) sets `stop_grace_period: 35s` for the same reason.
 
 ### Docker Compose
 
-[examples/docker-compose.yml](examples/docker-compose.yml) wires horizon-firehose against a Redis service on a private compose network. It's reference material — copy it out of `examples/` and adapt to your infrastructure (managed Redis, secret management, log shipping, etc.).
+[examples/docker-compose.yml](horizon-firehose/examples/docker-compose.yml) wires horizon-firehose against a Redis service on a private compose network. It's reference material — copy it out of `examples/` and adapt to your infrastructure (managed Redis, secret management, log shipping, etc.).
 
 ## Working with proto-blue
 
@@ -60,11 +67,11 @@ This project depends on [proto-blue](https://github.com/dollspace-gay/proto-blue
 
 To upgrade proto-blue:
 1. Find the target commit SHA from the proto-blue repository
-2. Update the `rev = "..."` value for all proto-blue dependencies in `Cargo.toml`
-3. Run `cargo check` to verify compatibility
+2. Update the `rev = "..."` value for all proto-blue dependencies in `horizon-firehose/Cargo.toml`
+3. Run `cargo check` from `horizon-firehose/` to verify compatibility
 4. Update `.github/expected-proto-blue-sha.txt` to the new SHA (CI's integrity check — see `.github/verify-proto-blue-sha.sh`)
 5. Run the full test suite (`cargo test`) before committing the bump
-6. Commit `Cargo.toml`, `Cargo.lock`, and the expected-sha file together. Note the SHA change in the commit message.
+6. Commit `horizon-firehose/Cargo.toml`, `horizon-firehose/Cargo.lock`, and the expected-sha file together. Note the SHA change in the commit message.
 
 When proto-blue publishes tagged releases, this project will switch to tag-based pinning for easier tracking.
 

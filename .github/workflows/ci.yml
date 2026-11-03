@@ -18,6 +18,11 @@ env:
   # `-D warnings` intent is scoped to clippy (our code) via the
   # `-- -D warnings` args on the clippy job below.
 
+# The crate lives in horizon-firehose/; every `run:` step starts there.
+defaults:
+  run:
+    working-directory: horizon-firehose
+
 jobs:
   # ─── Fast feedback: fmt + clippy on a small runner ──────────────────
   lint:
@@ -33,6 +38,8 @@ jobs:
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: horizon-firehose
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -60,6 +67,8 @@ jobs:
 
       - name: Cache cargo registry (Cargo.lock is already in-tree)
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: horizon-firehose
 
       # `cargo fetch --locked` populates Cargo.lock without building.
       # Required because the expected-SHA script reads Cargo.lock, and
@@ -69,7 +78,7 @@ jobs:
         run: cargo fetch --locked
 
       - name: Verify proto-blue resolved SHA matches expected
-        run: bash .github/verify-proto-blue-sha.sh
+        run: bash ../.github/verify-proto-blue-sha.sh
 
   # ─── Build + test ──────────────────────────────────────────────────
   test:
@@ -83,6 +92,8 @@ jobs:
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: horizon-firehose
 
       - name: cargo build --locked --all-targets
         run: cargo build --locked --all-targets
@@ -163,7 +174,7 @@ jobs:
       - name: Build image (load to local daemon, no registry push)
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: horizon-firehose
           load: true
           tags: horizon-firehose:ci
           # Reuse layers from prior main-branch builds. `mode=max`
