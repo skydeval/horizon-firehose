@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Dependency updates for RustSec advisories: rustls 0.23.46,
+  rustls-webpki 0.103.16, webpki-roots 1.0.11, h2 0.4.20, tokio 1.54.1,
+  anyhow 1.0.104.
+- RUSTSEC-2026-0387 (crypto-bigint 0.5.5) is ignored in CI: it is
+  reached only through proto-blue's signing code, which this project
+  never calls and which holds no secrets here. It can be removed once
+  proto-blue moves to newer RustCrypto crates.
+
 ## [0.2.0] - 2026-11-03
 
 All new stream behaviour is opt-in. With the new options at their

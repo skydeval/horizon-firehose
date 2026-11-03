@@ -139,6 +139,13 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: horizon-firehose
+          # RUSTSEC-2026-0387 (crypto-bigint 0.5.5, timing variability
+          # in constant-time ops on secret integers). Reached only via
+          # proto-blue-crypto → k256/p256 0.13; horizon-firehose holds
+          # no secret keys and never signs or verifies. Fixed only in
+          # crypto-bigint 0.7, which needs proto-blue to move to newer
+          # RustCrypto crates. Remove this when it does.
+          ignore: RUSTSEC-2026-0387
 
   # ─── Docker image build + smoke test ───────────────────────────────
   # Phase 9: build the multi-stage production image and confirm the
