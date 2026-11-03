@@ -7,8 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
+All new stream behaviour is opt-in. With the new options at their
+defaults, the stream is the same as 0.1.0 apart from the `_cap` field,
+and existing config files load unchanged (no `config_version` bump).
+
 ### Added
 
+- `_cap` on every stream entry's `data`: `{"v": 1, "caps": [...]}`
+  listing the enabled optional behaviours (`sync`, `resume`,
+  `oplessFiltered`), plus `record_types` when the filter is non-empty.
+  Also reported in `startup_metrics` as `cap`.
+- `publisher.publish_sync` (default false): publish `#sync` frames as
+  `sync` entries (`did`, `rev`, `time`, `_relay`) instead of skipping
+  them.
+- `publisher.publish_resume` (default false): publish a `resume` entry
+  at each point where events were lost: an `OutdatedCursor` handled
+  under `live_tip`, a dial with no saved cursor, or a relay sequence
+  reset accepted under `live_tip`. Fields: `reason`, `saved_cursor`,
+  `first_lost_seq`, `continues_from`, `_relay`. Resume entries have no
+  stream-level `seq`, and are never published for frames the replay
+  guard drops.
+- `filter.forward_opless_commits` (default false): with a non-empty
+  record filter, forward a commit whose ops all filter out as a commit
+  with `ops: []` instead of dropping it, keeping each repo's rev chain
+  whole.
 - Commit events carry the frame's `since` (the rev of the repo's
   previous commit), or `null` when absent.
 - Replay guard: events at or below a relay's published cursor are
@@ -34,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stall, now resumes from the current cursor. Previously they re-used
   the cursor from the original connection and could replay hours of
   history.
+- A commit dropped entirely by the record filter now moves the cursor
+  past it. Previously, with a narrow filter, the cursor lagged behind
+  and a restart re-read those commits.
 
 ## [0.1.0] - 2026-04-20
 

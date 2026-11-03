@@ -95,6 +95,7 @@ async fn pipeline_publishes_every_fixture_event_and_advances_cursor() {
     let router_handle = router::spawn(
         RouterOptions {
             record_types: vec![],
+            forward_opless_commits: false,
         },
         router_in_rx,
         pub_in_tx,
@@ -156,6 +157,7 @@ async fn pipeline_with_filter_drops_non_matching_commits() {
     let router_handle = router::spawn(
         RouterOptions {
             record_types: vec!["app.bsky.feed.post".into()],
+            forward_opless_commits: false,
         },
         router_in_rx,
         pub_in_tx,
@@ -193,7 +195,13 @@ async fn pipeline_with_filter_drops_non_matching_commits() {
         router_stats.events_out,
         router_stats.events_dropped
     );
-    assert_eq!(router_stats.events_out, pub_stats.events_published);
+    // Every dropped commit is forwarded as a cursor skip instead, so
+    // the router's output is the published events plus one skip each.
+    assert_eq!(
+        router_stats.events_out,
+        pub_stats.events_published + router_stats.events_dropped
+    );
+    assert_eq!(pub_stats.skip_advances, router_stats.events_dropped);
 
     // Identity/account/handle/tombstone events should all have made
     // it through regardless of the filter.
@@ -229,6 +237,7 @@ async fn pipeline_maxlen_trims_but_cursor_reflects_all_publishes() {
     let router_handle = router::spawn(
         RouterOptions {
             record_types: vec![],
+            forward_opless_commits: false,
         },
         router_in_rx,
         pub_in_tx,
@@ -317,6 +326,7 @@ async fn pipeline_recovers_from_transient_redis_outage_without_losing_events() {
     let router_handle = router::spawn(
         RouterOptions {
             record_types: vec![],
+            forward_opless_commits: false,
         },
         router_in_rx,
         pub_in_tx,

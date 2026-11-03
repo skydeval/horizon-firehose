@@ -61,6 +61,10 @@ cleanup_unknown_cursors = false
 # Empty array passes all record types through. Populate with NSIDs
 # to drop everything else, e.g. record_types = ["app.bsky.feed.post"].
 record_types = []
+# With a non-empty record_types, forward a commit whose ops all filter
+# out as an op-less commit (ops: []) instead of dropping it, so a
+# consumer still sees every rev of each repo. Optional; default false.
+forward_opless_commits = false
 
 [cursor]
 save_interval_seconds = 5
@@ -89,6 +93,18 @@ max_event_size_bytes = 1048576    # 1 MiB
 # "skip_with_log" — drop the event, log at WARN, increment counter.
 # "fail_hard"     — exit non-zero.
 on_oversize = "skip_with_log"
+# Publish #sync frames as "sync" entries ({did, rev, time, _relay})
+# instead of skipping them. Optional; default false.
+publish_sync = false
+# Publish a "resume" entry at each point where events were lost: the
+# relay rejected the cursor (OutdatedCursor under live_tip), a dial
+# went out with no saved cursor, or a relay sequence reset was
+# accepted under live_tip. Resume entries have no stream-level seq.
+# Optional; default false.
+publish_resume = false
+# Every entry's data also carries "_cap": {"v": 1, "caps": [...]}
+# listing which of these options are on (plus "record_types" when the
+# filter is non-empty). It is always present and needs no setting.
 
 [logging]
 # Either a bare level (trace|debug|info|warn|error) or any

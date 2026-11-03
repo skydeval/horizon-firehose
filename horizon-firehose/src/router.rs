@@ -17,12 +17,15 @@
 //!       mirrors how `redis_consumer_worker.py` dispatches deletes: by
 //!       the collection derived from the path, not by the absent record.
 //!
-//!   A commit whose entire op list filters out is dropped — we never
-//!   emit a commit with zero ops, because the downstream worker
-//!   interprets that as "nothing happened" and would waste a read.
-//! - **Identity / account / handle / tombstone** — always pass through.
-//!   They're not record-bearing; filtering them would break AppViews
-//!   that rely on identity updates regardless of record-type config.
+//!   A commit whose entire op list filters out is dropped, and the
+//!   router forwards an in-band `PublishOp::Skip` for its seq so the
+//!   cursor still moves past it. With `filter.forward_opless_commits`
+//!   it is forwarded instead as an op-less commit (`ops: []`), so a
+//!   consumer sees every rev in each repo's chain.
+//! - **Identity / account / handle / tombstone / sync** — always pass
+//!   through. They're not record-bearing; filtering them would break
+//!   AppViews that rely on identity updates regardless of record-type
+//!   config.
 
 use std::collections::HashSet;
 
@@ -47,12 +50,23 @@ pub enum FilterOutcome {
 /// Pure filter function. Exposed separately from [`spawn`] so it's
 /// trivial to unit-test without wiring up channels.
 pub fn filter_event(event: Event, filter: &HashSet<String>) -> FilterOutcome {
+    filter_event_with(event, filter, false)
+}
+
+/// [`filter_event`] with `filter.forward_opless_commits`: when true, a
+/// commit whose ops all filter out passes as an op-less commit instead
+/// of being dropped.
+pub fn filter_event_with(
+    event: Event,
+    filter: &HashSet<String>,
+    forward_opless: bool,
+) -> FilterOutcome {
     if filter.is_empty() {
         return FilterOutcome::Pass(event);
     }
 
     match event {
-        Event::Commit(commit) => filter_commit(commit, filter),
+        Event::Commit(commit) => filter_commit(commit, filter, forward_opless),
         // Non-record-bearing events always pass through per DESIGN.md
         // §3 — filtering them would lose identity updates that the
         // downstream indexer uses regardless of what record types it
@@ -61,9 +75,13 @@ pub fn filter_event(event: Event, filter: &HashSet<String>) -> FilterOutcome {
     }
 }
 
-fn filter_commit(mut commit: CommitEvent, filter: &HashSet<String>) -> FilterOutcome {
+fn filter_commit(
+    mut commit: CommitEvent,
+    filter: &HashSet<String>,
+    forward_opless: bool,
+) -> FilterOutcome {
     commit.ops.retain(|op| op_matches_filter(op, filter));
-    if commit.ops.is_empty() {
+    if commit.ops.is_empty() && !forward_opless {
         FilterOutcome::Drop
     } else {
         FilterOutcome::Pass(Event::Commit(commit))
@@ -90,6 +108,8 @@ fn op_matches_filter(op: &crate::event::Operation, filter: &HashSet<String>) -> 
 pub struct RouterOptions {
     /// Allow-list of NSIDs. Empty = pass everything.
     pub record_types: Vec<String>,
+    /// `filter.forward_opless_commits`.
+    pub forward_opless_commits: bool,
 }
 
 /// Counters surfaced on shutdown.
@@ -131,6 +151,7 @@ pub fn spawn(
 ) -> RouterHandle {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let filter: HashSet<String> = opts.record_types.into_iter().collect();
+    let forward_opless = opts.forward_opless_commits;
 
     let task = crate::spawn_instrumented("router", async move {
         let mut stats = RouterStats::default();
@@ -148,17 +169,22 @@ pub fn spawn(
                     };
                     stats.events_in += 1;
                     let forwarded = match op {
-                        // Skip-advance passes through untouched; it
-                        // carries no record body to filter on.
-                        PublishOp::Skip { .. } => Some(op),
+                        // Skip-advances and resume markers pass through
+                        // untouched; they carry no record body.
+                        PublishOp::Skip { .. } | PublishOp::Resume { .. } => Some(op),
                         PublishOp::Publish(event, seq) => {
-                            match filter_event(event, &filter) {
+                            // Kept for the skip below; only needed when
+                            // a filter can drop the event.
+                            let relay = (!filter.is_empty()).then(|| event.relay().to_string());
+                            match filter_event_with(event, &filter, forward_opless) {
                                 FilterOutcome::Pass(ev) => {
                                     Some(PublishOp::Publish(ev, seq))
                                 }
                                 FilterOutcome::Drop => {
                                     stats.events_dropped += 1;
-                                    None
+                                    // Move the cursor past the dropped
+                                    // commit, in order, as for `#sync`.
+                                    relay.map(|relay| PublishOp::Skip { relay, seq })
                                 }
                             }
                         }
@@ -355,6 +381,7 @@ mod tests {
         let handle = spawn(
             RouterOptions {
                 record_types: vec!["app.bsky.feed.post".into()],
+                forward_opless_commits: false,
             },
             in_rx,
             out_tx,
@@ -392,16 +419,83 @@ mod tests {
         drop(in_tx);
 
         let mut seqs = Vec::new();
+        let mut skips = Vec::new();
         while let Some(op) = out_rx.recv().await {
-            if let PublishOp::Publish(_, seq) = op {
-                seqs.push(seq);
+            match op {
+                PublishOp::Publish(_, seq) => seqs.push(seq),
+                PublishOp::Skip { relay, seq } => skips.push((relay, seq)),
+                PublishOp::Resume { .. } => panic!("router never invents resume markers"),
             }
         }
         assert_eq!(seqs, vec![1, 3]);
+        // The dropped commit still moves the cursor, in order.
+        assert_eq!(skips, vec![("ws://test".to_string(), 2)]);
 
         let stats = handle.shutdown().await;
         assert_eq!(stats.events_in, 3);
-        assert_eq!(stats.events_out, 2);
+        assert_eq!(stats.events_out, 3);
         assert_eq!(stats.events_dropped, 1);
+    }
+
+    #[test]
+    fn opless_forwarding_keeps_a_fully_filtered_commit_with_no_ops() {
+        let mut f = HashSet::new();
+        f.insert("app.bsky.feed.post".to_string());
+        let ev = commit(vec![op_with_type("app.bsky.feed.like", "create")]);
+        match filter_event_with(ev, &f, true) {
+            FilterOutcome::Pass(Event::Commit(c)) => {
+                assert!(c.ops.is_empty());
+                assert_eq!(c.relay, "ws://test");
+            }
+            other => panic!("expected an op-less commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opless_forwarding_still_filters_ops_of_partly_matching_commits() {
+        let mut f = HashSet::new();
+        f.insert("app.bsky.feed.post".to_string());
+        let ev = commit(vec![
+            op_with_type("app.bsky.feed.post", "create"),
+            op_with_type("app.bsky.feed.like", "create"),
+        ]);
+        match filter_event_with(ev, &f, true) {
+            FilterOutcome::Pass(Event::Commit(c)) => {
+                assert_eq!(c.ops.len(), 1);
+                assert!(c.ops[0].path.starts_with("app.bsky.feed.post/"));
+            }
+            other => panic!("expected the post op to survive, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_forwards_opless_commit_instead_of_skip_when_enabled() {
+        let (in_tx, in_rx) = mpsc::channel::<PublishOp>(16);
+        let (out_tx, mut out_rx) = mpsc::channel::<PublishOp>(16);
+        let handle = spawn(
+            RouterOptions {
+                record_types: vec!["app.bsky.feed.post".into()],
+                forward_opless_commits: true,
+            },
+            in_rx,
+            out_tx,
+        );
+        in_tx
+            .send(PublishOp::Publish(
+                commit(vec![op_with_type("app.bsky.feed.like", "create")]),
+                9,
+            ))
+            .await
+            .unwrap();
+        drop(in_tx);
+
+        let op = out_rx.recv().await.expect("one op forwarded");
+        match op {
+            PublishOp::Publish(Event::Commit(c), 9) => assert!(c.ops.is_empty()),
+            other => panic!("expected op-less commit at seq 9, got {other:?}"),
+        }
+        assert!(out_rx.recv().await.is_none());
+        let stats = handle.shutdown().await;
+        assert_eq!(stats.events_dropped, 0);
     }
 }

@@ -86,14 +86,16 @@ pub enum BackendError {
 pub trait StreamBackend: Send + Sync + 'static {
     /// XADD `stream_key` with MAXLEN-approximate trimming at `max_len`.
     /// Fields are `type` / `data` / `seq` per DESIGN.md §4 Redis stream
-    /// format. Returns the assigned stream entry ID on success.
+    /// format; `seq: None` omits the `seq` field (used for `resume`
+    /// entries, which are not firehose frames). Returns the assigned
+    /// stream entry ID on success.
     fn xadd(
         &self,
         stream_key: &str,
         max_len: u64,
         event_type: &str,
         data: &[u8],
-        seq: u64,
+        seq: Option<u64>,
     ) -> impl std::future::Future<Output = Result<String, BackendError>> + Send;
 
     /// SET `key` = decimal string of `seq`.
@@ -252,14 +254,14 @@ impl StreamBackend for RedisBackend {
         max_len: u64,
         event_type: &str,
         data: &[u8],
-        seq: u64,
+        seq: Option<u64>,
     ) -> Result<String, BackendError> {
-        let seq_str = seq.to_string();
-        let items: &[(&str, &[u8])] = &[
-            ("type", event_type.as_bytes()),
-            ("data", data),
-            ("seq", seq_str.as_bytes()),
-        ];
+        let seq_str = seq.map(|s| s.to_string());
+        let mut items: Vec<(&str, &[u8])> = vec![("type", event_type.as_bytes()), ("data", data)];
+        if let Some(s) = &seq_str {
+            items.push(("seq", s.as_bytes()));
+        }
+        let items = items.as_slice();
         let id: String = self
             .conn
             .clone()
@@ -469,7 +471,7 @@ impl StreamBackend for InMemoryBackend {
         max_len: u64,
         event_type: &str,
         data: &[u8],
-        seq: u64,
+        seq: Option<u64>,
     ) -> Result<String, BackendError> {
         let mut state = self.inner.lock().await;
         Self::maybe_inject_failure(&mut state, "xadd")?;
@@ -479,11 +481,13 @@ impl StreamBackend for InMemoryBackend {
             format!("{}-0", state.next_id)
         };
 
-        let fields = vec![
+        let mut fields = vec![
             ("type".to_string(), event_type.as_bytes().to_vec()),
             ("data".to_string(), data.to_vec()),
-            ("seq".to_string(), seq.to_string().into_bytes()),
         ];
+        if let Some(seq) = seq {
+            fields.push(("seq".to_string(), seq.to_string().into_bytes()));
+        }
 
         let inserted_at = chrono::Utc::now();
         let entries = state.streams.entry(stream_key.to_string()).or_default();
@@ -572,7 +576,7 @@ mod tests {
     async fn xadd_trims_to_max_len() {
         let b = InMemoryBackend::new();
         for i in 0..10u64 {
-            b.xadd("k", 3, "commit", b"{}", i).await.unwrap();
+            b.xadd("k", 3, "commit", b"{}", Some(i)).await.unwrap();
         }
         assert_eq!(b.xlen("k").await.unwrap(), 3);
     }
@@ -674,9 +678,9 @@ mod tests {
     async fn fail_next_consumes_one_failure_per_op() {
         let b = InMemoryBackend::new();
         b.set_fail_mode(FailMode::FailNext(2)).await;
-        assert!(b.xadd("k", 10, "t", b"d", 1).await.is_err());
-        assert!(b.xadd("k", 10, "t", b"d", 2).await.is_err());
-        assert!(b.xadd("k", 10, "t", b"d", 3).await.is_ok());
+        assert!(b.xadd("k", 10, "t", b"d", Some(1)).await.is_err());
+        assert!(b.xadd("k", 10, "t", b"d", Some(2)).await.is_err());
+        assert!(b.xadd("k", 10, "t", b"d", Some(3)).await.is_ok());
         assert_eq!(b.xlen("k").await.unwrap(), 1);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "horizon-firehose"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # MSRV: proto-blue (0.2.5, c8acc1ba) uses stabilised-in-1.88 `let`
 # chains in `proto-blue-lexicon/src/validation.rs`. Building with

@@ -42,6 +42,12 @@ Tests cover the exact case: with `commit@100`, `skip@101`,
 `commit@102` queued and the first XADD blocked, the cursor stays unset,
 and once unblocked it moves 100 → 101 → 102.
 
+Three kinds of frame travel as skips: `#sync` when
+`publisher.publish_sync` is off, oversize events under
+`skip_with_log`, and, since 0.2.0, commits the record filter dropped
+entirely. Before 0.2.0 a fully filtered commit sent nothing on, so with
+a narrow filter the cursor lagged and a restart re-read those commits.
+
 Cursor advances are forward-only.
 
 ## Relay selection and failover
@@ -148,7 +154,8 @@ counts `relay_seq_resets`, and applies `on_stale_cursor`:
 - **`live_tip`**: logs WARN `relay_seq_reset`, moves the cursor back to
   just below the current seq, and resumes publishing. Events dropped
   during the window are lost, which is what `live_tip` already means
-  when a relay rejects a cursor.
+  when a relay rejects a cursor. With `publisher.publish_resume`, a
+  `resume` entry (`relay_seq_reset`) is published at the rebase.
 - **`exit`**: logs ERROR `policy_exit` with a reason that names the
   cursor key and the `redis-cli DEL` command to clear it, then runs
   the normal shutdown and exits non-zero. A relay that really did reset
@@ -164,10 +171,41 @@ which an endless silent drop would not.
 ## Protocol error frames
 
 - `#info` with `OutdatedCursor`: handled by `on_stale_cursor`
-  (`live_tip` by default, or `exit`).
+  (`live_tip` by default, or `exit`). Under `live_tip` nothing
+  reconnects: the relay keeps streaming on the same connection from the
+  oldest event it still has, and everything between the cursor and that
+  event is lost.
 - Any other error frame: logged at ERROR and handled by
   `on_protocol_error` (`reconnect_from_live_tip` by default, or
   `exit`).
+
+## Reporting loss: `resume` entries
+
+With `publisher.publish_resume`, each point where events were lost is
+published on the stream as a `resume` entry, so a consumer can record
+the gap instead of inferring it. There are three: a stale cursor under
+`live_tip`, a dial with no saved cursor, and an accepted relay
+sequence reset.
+
+They follow the same ordering rules as the cursor:
+
+- **In-band markers.** The decoder sends `PublishOp::Resume` through
+  the pipeline when it sees `OutdatedCursor`. For a dial with no saved
+  cursor, the ws_reader's URL function flags the dial, and the reader
+  sends a marker ahead of that connection's first frame. So a marker is
+  always behind the previous connection's events and ahead of the new
+  ones.
+- **Published at the first forward op.** The publisher holds the
+  marker until the next op that moves that relay's cursor forward, and
+  XADDs the `resume` just before it, with `continues_from` = its seq.
+  Frames the replay guard drops never trigger it, so the overlap after
+  an ordinary reconnect never produces one.
+- **No seq, no cursor move.** The entry has no stream-level `seq` and
+  does not touch the cursor; the event after it does. A crash in
+  between reports the same loss again on restart, rather than losing
+  the report.
+
+The entry format is in [event-format.md](event-format.md#resume).
 
 ## Duplicates
 

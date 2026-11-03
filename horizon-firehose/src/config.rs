@@ -96,6 +96,12 @@ pub struct FilterConfig {
     /// Empty = pass all record types through.
     #[serde(default)]
     pub record_types: Vec<String>,
+    /// With a non-empty `record_types`, forward a commit whose ops all
+    /// filter out as an op-less commit (`ops: []`) instead of dropping
+    /// it, so a consumer still sees every rev in each repo's chain.
+    /// Optional; default false.
+    #[serde(default)]
+    pub forward_opless_commits: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -148,6 +154,15 @@ pub enum ProtocolErrorPolicy {
 pub struct PublisherConfig {
     pub max_event_size_bytes: u64,
     pub on_oversize: OversizePolicy,
+    /// Publish `#sync` frames as `sync` entries instead of skipping
+    /// them. Optional; default false.
+    #[serde(default)]
+    pub publish_sync: bool,
+    /// Publish a `resume` entry at each point where events were lost
+    /// (stale cursor, dial with no saved cursor, relay sequence reset).
+    /// Optional; default false.
+    #[serde(default)]
+    pub publish_resume: bool,
 }
 
 impl Default for PublisherConfig {
@@ -155,6 +170,8 @@ impl Default for PublisherConfig {
         Self {
             max_event_size_bytes: 1_048_576,
             on_oversize: OversizePolicy::SkipWithLog,
+            publish_sync: false,
+            publish_resume: false,
         }
     }
 }
@@ -293,6 +310,16 @@ impl Config {
     /// stripped — safe to log under `startup_metrics.redis_url_host`.
     pub fn redis_url_host(&self) -> String {
         sanitize_redis_host(&self.redis.url)
+    }
+
+    /// The `_cap` stamp this configuration puts on every stream entry.
+    pub fn capabilities(&self) -> crate::event::Capabilities {
+        crate::event::Capabilities {
+            sync: self.publisher.publish_sync,
+            resume: self.publisher.publish_resume,
+            opless_filtered: self.filter.forward_opless_commits,
+            record_types: self.filter.record_types.clone(),
+        }
     }
 }
 

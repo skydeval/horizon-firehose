@@ -57,6 +57,26 @@ Things to know:
   about five minutes at typical firehose rates. If a consumer can be
   down longer than that, raise it or that consumer will miss events.
 
+### Optional stream entries
+
+Three options add to what goes on the stream. All are off by default.
+Turn them on only once every consumer of the stream understands them:
+a reader that rejects unknown entry types will fail on `sync` and
+`resume`.
+
+```toml
+[filter]
+forward_opless_commits = false   # fully filtered commits as commits with ops: []
+
+[publisher]
+publish_sync = false             # #sync frames as "sync" entries
+publish_resume = false           # a "resume" entry at each loss point
+```
+
+Every entry also carries a `_cap` field listing which of these are on.
+It needs no setting. See
+[design/event-format.md](design/event-format.md#_cap) for the formats.
+
 ### Environment overrides
 
 Any field can be overridden with `HORIZON_FIREHOSE_` plus the section

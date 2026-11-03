@@ -107,6 +107,8 @@ fn test_publisher_opts() -> PublisherOptions {
         max_stream_len: 1_000,
         max_event_size_bytes: 1 << 20,
         on_oversize: OversizePolicy::SkipWithLog,
+        cap_field: crate::event::Capabilities::default().field_bytes(),
+        publish_resume: false,
         retry_initial: Duration::from_millis(10),
         retry_max: Duration::from_millis(50),
         retry_warn_interval: Duration::from_millis(200),
@@ -155,6 +157,8 @@ async fn end_to_end_pipeline_delivers_event_to_backend() {
         decoder::DecoderPolicies {
             on_stale_cursor: crate::config::StaleCursorPolicy::LiveTip,
             on_protocol_error: crate::config::ProtocolErrorPolicy::ReconnectFromLiveTip,
+            publish_sync: false,
+            publish_resume: false,
         },
         shutdown_tx.clone(),
         decoder_policy_exit_tx,
@@ -162,6 +166,7 @@ async fn end_to_end_pipeline_delivers_event_to_backend() {
     let router_h = router::spawn(
         RouterOptions {
             record_types: vec![],
+            forward_opless_commits: false,
         },
         event_rx,
         filtered_tx,
@@ -241,6 +246,8 @@ async fn shutdown_cascade_finalises_cursor_within_budget() {
         decoder::DecoderPolicies {
             on_stale_cursor: crate::config::StaleCursorPolicy::LiveTip,
             on_protocol_error: crate::config::ProtocolErrorPolicy::ReconnectFromLiveTip,
+            publish_sync: false,
+            publish_resume: false,
         },
         shutdown_tx.clone(),
         decoder_policy_exit_tx,
@@ -248,6 +255,7 @@ async fn shutdown_cascade_finalises_cursor_within_budget() {
     let router_h = router::spawn(
         RouterOptions {
             record_types: vec![],
+            forward_opless_commits: false,
         },
         event_rx,
         filtered_tx,
@@ -363,6 +371,7 @@ async fn pipeline_initializes_even_when_backend_is_failing_then_shuts_down() {
     let router_h = router::spawn(
         RouterOptions {
             record_types: vec![],
+            forward_opless_commits: false,
         },
         event_rx,
         filtered_tx,
@@ -1038,6 +1047,7 @@ fn cfg_with_tls(tls: &str) -> crate::config::Config {
         },
         filter: FilterConfig {
             record_types: vec![],
+            forward_opless_commits: false,
         },
         cursor: CursorConfig {
             save_interval_seconds: 5,
@@ -1048,6 +1058,8 @@ fn cfg_with_tls(tls: &str) -> crate::config::Config {
         publisher: PublisherConfig {
             max_event_size_bytes: 1_048_576,
             on_oversize: OversizePolicy::SkipWithLog,
+            publish_sync: false,
+            publish_resume: false,
         },
         logging: LoggingConfig {
             level: "info".into(),
@@ -1201,6 +1213,7 @@ async fn startup_metrics_only_emits_allowlisted_fields_no_credentials() {
         },
         filter: FilterConfig {
             record_types: vec![],
+            forward_opless_commits: false,
         },
         cursor: CursorConfig {
             save_interval_seconds: 5,
@@ -1211,6 +1224,8 @@ async fn startup_metrics_only_emits_allowlisted_fields_no_credentials() {
         publisher: PublisherConfig {
             max_event_size_bytes: 1_048_576,
             on_oversize: OversizePolicy::SkipWithLog,
+            publish_sync: false,
+            publish_resume: false,
         },
         logging: LoggingConfig {
             level: "info".into(),
@@ -1306,4 +1321,243 @@ async fn emitter_exits_promptly_on_shutdown_signal() {
         "emitter took {elapsed:?} to exit on shutdown; should be ≪ the 10s ticker"
     );
     throwaway.shutdown().await;
+}
+
+// ─── 0.2.0 stream options, end to end ─────────────────────────────
+
+type StreamDump = (
+    Vec<(String, serde_json::Value, Option<String>)>,
+    Option<u64>,
+);
+
+/// Run a mock relay sending `#sync@42` then one fixture commit, with no
+/// saved cursor. See [`run_stream_frames`].
+async fn run_stream_options(
+    publish_sync: bool,
+    publish_resume: bool,
+    expect_entries: u64,
+) -> Option<StreamDump> {
+    let sync = decoder::sync_frame_for_tests("did:plc:sync", Some("3ksync"), 42);
+    run_stream_frames(
+        vec![sync],
+        None,
+        publish_sync,
+        publish_resume,
+        expect_entries,
+    )
+    .await
+}
+
+/// Run a mock relay sending `first` then one fixture commit through the
+/// real ws_reader → decoder → router → publisher, starting from
+/// `saved_cursor`. Returns `(type, data, seq)` per stream entry once
+/// `expect_entries` have landed, plus the relay's final cursor.
+async fn run_stream_frames(
+    first: Vec<Vec<u8>>,
+    saved_cursor: Option<u64>,
+    publish_sync: bool,
+    publish_resume: bool,
+    expect_entries: u64,
+) -> Option<StreamDump> {
+    let commit = sample_fixture_frame()?;
+    let mut frames = first;
+    frames.push(commit);
+    let (base, server_task) = start_mock_ws(frames).await;
+    // A real relay path, so a `?cursor=N` dial is a well-formed URL.
+    let url = format!("{base}/xrpc/com.atproto.sync.subscribeRepos");
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let cursors = Cursors::new();
+    if let Some(c) = saved_cursor {
+        cursors.advance(&url, c).await;
+    }
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (event_tx, event_rx) = mpsc::channel::<PublishOp>(128);
+    let (filtered_tx, filtered_rx) = mpsc::channel::<PublishOp>(128);
+
+    let ws_reader = ws_reader::spawn_with_cursors(
+        relay_cfg(url.clone()),
+        WsReaderOptions {
+            mark_dials_without_cursor: publish_resume,
+            ..WsReaderOptions::default()
+        },
+        cursors.clone(),
+        shutdown_rx.clone(),
+        Metrics::new(),
+    );
+    let ws_control = ws_reader.control();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel::<decoder::PolicyExit>();
+    let decoder_h = decoder::spawn(
+        ws_reader,
+        event_tx,
+        Metrics::new(),
+        ws_control,
+        decoder::DecoderPolicies {
+            on_stale_cursor: crate::config::StaleCursorPolicy::LiveTip,
+            on_protocol_error: crate::config::ProtocolErrorPolicy::ReconnectFromLiveTip,
+            publish_sync,
+            publish_resume,
+        },
+        shutdown_tx.clone(),
+        exit_tx,
+    );
+    let router_h = router::spawn(
+        RouterOptions {
+            record_types: vec![],
+            forward_opless_commits: false,
+        },
+        event_rx,
+        filtered_tx,
+    );
+    let cap = crate::event::Capabilities {
+        sync: publish_sync,
+        resume: publish_resume,
+        ..Default::default()
+    };
+    let publisher_h = publisher::spawn(
+        backend.clone(),
+        cursors.clone(),
+        PublisherOptions {
+            cap_field: cap.field_bytes(),
+            publish_resume,
+            ..test_publisher_opts()
+        },
+        filtered_rx,
+        Metrics::new(),
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if backend.xlen("firehose:events").await.unwrap() >= expect_entries {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Give anything unexpected a moment to land too.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let entries = backend
+        .stream_entries("firehose:events")
+        .await
+        .into_iter()
+        .map(|(_, _, fields)| {
+            let get = |k: &str| {
+                fields
+                    .iter()
+                    .find(|(f, _)| f == k)
+                    .map(|(_, v)| String::from_utf8(v.clone()).unwrap())
+            };
+            (
+                get("type").unwrap(),
+                serde_json::from_str(&get("data").unwrap()).unwrap(),
+                get("seq"),
+            )
+        })
+        .collect();
+    let cursor = cursors.get(&url).await;
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), decoder_h.join()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), router_h.shutdown()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), publisher_h.join()).await;
+    server_task.abort();
+    Some((entries, cursor))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn defaults_skip_sync_and_publish_no_resume_but_stamp_cap() {
+    let Some((entries, cursor)) = run_stream_options(false, false, 1).await else {
+        eprintln!("SKIP: no fixtures available");
+        return;
+    };
+    let types: Vec<_> = entries.iter().map(|(t, _, _)| t.as_str()).collect();
+    assert_eq!(
+        types,
+        vec!["commit"],
+        "defaults must look like 0.1 plus _cap"
+    );
+    assert_eq!(
+        entries[0].1["_cap"],
+        serde_json::json!({"v": 1, "caps": []})
+    );
+    // The skipped #sync@42 still sat before the commit; the commit's
+    // seq is the final cursor.
+    assert_eq!(cursor, entries[0].2.as_deref().map(|s| s.parse().unwrap()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_and_resume_enabled_publish_resume_then_sync_then_commit() {
+    let Some((entries, cursor)) = run_stream_options(true, true, 3).await else {
+        eprintln!("SKIP: no fixtures available");
+        return;
+    };
+    let types: Vec<_> = entries.iter().map(|(t, _, _)| t.as_str()).collect();
+    assert_eq!(types, vec!["resume", "sync", "commit"]);
+
+    let (_, resume, resume_seq) = &entries[0];
+    assert_eq!(resume["reason"], "no_saved_cursor");
+    assert!(resume["saved_cursor"].is_null());
+    assert!(resume["first_lost_seq"].is_null());
+    assert_eq!(resume["continues_from"], 42);
+    assert_eq!(resume_seq, &None);
+
+    let (_, sync, sync_seq) = &entries[1];
+    assert_eq!(sync["did"], "did:plc:sync");
+    assert_eq!(sync["rev"], "3ksync");
+    assert_eq!(sync_seq.as_deref(), Some("42"));
+
+    for (t, data, _) in &entries {
+        assert_eq!(
+            data["_cap"],
+            serde_json::json!({"v": 1, "caps": ["sync", "resume"]}),
+            "{t}"
+        );
+    }
+    assert_eq!(cursor, entries[2].2.as_deref().map(|s| s.parse().unwrap()));
+}
+
+/// `#info {name: "OutdatedCursor"}`, hand-encoded (canonical key order).
+fn outdated_cursor_frame() -> Vec<u8> {
+    let mut out = vec![0xA2];
+    out.extend_from_slice(&[0x61, b't', 0x65]);
+    out.extend_from_slice(b"#info");
+    out.extend_from_slice(&[0x62, b'o', b'p', 0x01]);
+    out.extend_from_slice(&[0xA1, 0x64]);
+    out.extend_from_slice(b"name");
+    out.push(0x6E);
+    out.extend_from_slice(b"OutdatedCursor");
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outdated_cursor_under_live_tip_publishes_resume_before_the_next_event() {
+    // The dial carries cursor 5, so no "no saved cursor" marker; the
+    // relay answers OutdatedCursor and continues from its oldest event.
+    let Some((entries, cursor)) =
+        run_stream_frames(vec![outdated_cursor_frame()], Some(5), false, true, 2).await
+    else {
+        eprintln!("SKIP: no fixtures available");
+        return;
+    };
+    let types: Vec<_> = entries.iter().map(|(t, _, _)| t.as_str()).collect();
+    assert_eq!(types, vec!["resume", "commit"]);
+    let resume = &entries[0].1;
+    let commit_seq: u64 = entries[1].2.as_deref().unwrap().parse().unwrap();
+    assert_eq!(resume["reason"], "outdated_cursor");
+    assert_eq!(resume["saved_cursor"], 5);
+    assert_eq!(resume["first_lost_seq"], 6);
+    assert_eq!(resume["continues_from"], commit_seq);
+    assert_eq!(cursor, Some(commit_seq));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outdated_cursor_without_publish_resume_adds_no_entry() {
+    let Some((entries, _)) =
+        run_stream_frames(vec![outdated_cursor_frame()], Some(5), false, false, 1).await
+    else {
+        eprintln!("SKIP: no fixtures available");
+        return;
+    };
+    let types: Vec<_> = entries.iter().map(|(t, _, _)| t.as_str()).collect();
+    assert_eq!(types, vec!["commit"]);
 }

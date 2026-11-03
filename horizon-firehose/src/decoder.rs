@@ -35,11 +35,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{ProtocolErrorPolicy, StaleCursorPolicy};
 use crate::event::{
-    AccountEvent, CommitEvent, Event, HandleEvent, IdentityEvent, Operation, TombstoneEvent,
+    AccountEvent, CommitEvent, Event, HandleEvent, IdentityEvent, Operation, ResumeReason,
+    SyncEvent, TombstoneEvent,
 };
 use crate::metrics::Metrics;
 use crate::publisher::PublishOp;
-use crate::ws_reader::{WsReader, WsReaderControl};
+use crate::ws_reader::{Frame, WsReader, WsReaderControl};
 
 /// Phase 10.5 finding 5.1: policy knobs the decoder consults when
 /// protocol-level signal frames arrive. Parsed into this struct once
@@ -49,15 +50,31 @@ use crate::ws_reader::{WsReader, WsReaderControl};
 pub struct DecoderPolicies {
     pub on_stale_cursor: StaleCursorPolicy,
     pub on_protocol_error: ProtocolErrorPolicy,
+    /// `publisher.publish_sync`: publish `#sync` as a `sync` event
+    /// instead of an in-band skip.
+    pub publish_sync: bool,
+    /// `publisher.publish_resume`: forward loss points (stale cursor,
+    /// dial with no saved cursor) to the publisher as resume markers.
+    pub publish_resume: bool,
 }
 
 impl DecoderPolicies {
-    /// Map from the user-facing `[cursor]` config section.
+    /// Map from the user-facing `[cursor]` config section. The stream
+    /// options start off; set them with [`Self::with_stream_options`].
     pub fn from_cursor_config(cfg: &crate::config::CursorConfig) -> Self {
         Self {
             on_stale_cursor: cfg.on_stale_cursor,
             on_protocol_error: cfg.on_protocol_error,
+            publish_sync: false,
+            publish_resume: false,
         }
+    }
+
+    /// Apply the `[publisher]` stream options.
+    pub fn with_stream_options(mut self, cfg: &crate::config::PublisherConfig) -> Self {
+        self.publish_sync = cfg.publish_sync;
+        self.publish_resume = cfg.publish_resume;
+        self
     }
 
     /// Decide what the decoder should do on an `OutdatedCursor`
@@ -141,15 +158,14 @@ pub enum DecodedFrame {
         name: String,
         message: Option<String>,
     },
-    /// A known frame type we deliberately do not republish (e.g.
-    /// `#sync`, which carries a repo's head CID without operations
-    /// and has nothing for the downstream Postgres indexer to write).
-    /// Distinct from `UnknownFrameType` — the latter is a real decode
-    /// failure for a type the protocol added without us noticing.
-    /// `seq` is surfaced so the cursor tracker can still advance past
-    /// a skipped frame (otherwise replays would loop forever on a
-    /// `#sync` at tip).
-    Skipped { kind: &'static str, seq: u64 },
+    /// `#sync`: a repo's current head without operations. Published as
+    /// a `sync` event under `publisher.publish_sync`; otherwise it is a
+    /// known skip (distinct from `UnknownFrameType`, which is a real
+    /// decode failure for a type the protocol added without us
+    /// noticing). Either way `seq` reaches the publisher in order, so
+    /// the cursor still advances past it (otherwise replays would loop
+    /// forever on a `#sync` at tip).
+    Sync { event: SyncEvent, seq: u64 },
 }
 
 #[derive(Debug, Error)]
@@ -324,13 +340,9 @@ pub fn decode_frame(bytes: &[u8], relay: &str) -> Result<DecodedFrame, DecodeErr
         "#tombstone" => decode_tombstone(body, relay),
         // `#sync` is the post-2025 firehose event that announces a
         // repo's current head without operations (used for fast
-        // catch-up). It carries no per-record data, so the Postgres
-        // indexer downstream has nothing to do with it. We still pull
-        // `seq` so the cursor can advance past it.
-        "#sync" => Ok(DecodedFrame::Skipped {
-            kind: "#sync",
-            seq: map_seq(body)?,
-        }),
+        // catch-up). The decoder task decides whether it is published
+        // or skipped; either way `seq` moves the cursor past it.
+        "#sync" => decode_sync(body, relay),
         "#info" => {
             // `#info` envelope (different from `op=-1` errors). DESIGN.md
             // §3 calls these out specifically for OutdatedCursor handling.
@@ -485,6 +497,75 @@ fn decode_tombstone(
             did: map_str(body, "did")?.to_string(),
             relay: relay.into(),
         }),
+        seq: map_seq(body)?,
+    })
+}
+
+/// Hand-encoded DAG-CBOR `#sync` frame for tests (the captured fixture
+/// corpus has none). Keys are in canonical order; `blocks` is omitted
+/// since the decoder doesn't read it. `rev = None` leaves `rev` out.
+#[cfg(test)]
+pub(crate) fn sync_frame_for_tests(did: &str, rev: Option<&str>, seq: u64) -> Vec<u8> {
+    fn text(out: &mut Vec<u8>, s: &str) {
+        let n = s.len();
+        assert!(n < 256, "test helper handles short strings only");
+        if n < 24 {
+            out.push(0x60 + n as u8);
+        } else {
+            out.push(0x78);
+            out.push(n as u8);
+        }
+        out.extend_from_slice(s.as_bytes());
+    }
+    let mut out = Vec::new();
+    // Header {"t": "#sync", "op": 1}
+    out.push(0xA2);
+    text(&mut out, "t");
+    text(&mut out, "#sync");
+    text(&mut out, "op");
+    out.push(0x01);
+    // Body {"did", "rev"?, "seq", "time"}
+    out.push(if rev.is_some() { 0xA4 } else { 0xA3 });
+    text(&mut out, "did");
+    text(&mut out, did);
+    if let Some(rev) = rev {
+        text(&mut out, "rev");
+        text(&mut out, rev);
+    }
+    text(&mut out, "seq");
+    // DAG-CBOR requires the shortest integer encoding.
+    match seq {
+        0..=23 => out.push(seq as u8),
+        24..=0xFF => out.extend_from_slice(&[0x18, seq as u8]),
+        0x100..=0xFFFF => {
+            out.push(0x19);
+            out.extend_from_slice(&(seq as u16).to_be_bytes());
+        }
+        0x1_0000..=0xFFFF_FFFF => {
+            out.push(0x1A);
+            out.extend_from_slice(&(seq as u32).to_be_bytes());
+        }
+        _ => {
+            out.push(0x1B);
+            out.extend_from_slice(&seq.to_be_bytes());
+        }
+    }
+    text(&mut out, "time");
+    text(&mut out, "2026-11-03T00:00:00.000Z");
+    out
+}
+
+fn decode_sync(
+    body: &BTreeMap<String, LexValue>,
+    relay: &str,
+) -> Result<DecodedFrame, DecodeError> {
+    Ok(DecodedFrame::Sync {
+        event: SyncEvent {
+            did: map_str(body, "did")?.to_string(),
+            rev: map_str(body, "rev")?.to_string(),
+            time: map_opt_str(body, "time")?.map(str::to_string),
+            relay: relay.into(),
+        },
         seq: map_seq(body)?,
     })
 }
@@ -902,7 +983,28 @@ pub fn spawn(
         let mut stats = DecoderStats::default();
         let mut consecutive_errors: u32 = 0;
 
-        while let Some((bytes, relay)) = reader.recv().await {
+        while let Some(item) = reader.recv().await {
+            let (bytes, relay) = match item {
+                Frame::Data { bytes, relay } => (bytes, relay),
+                Frame::DialedWithoutCursor { relay } => {
+                    // Only sent when publish_resume is on. In-band, so
+                    // the publisher sees it after the previous
+                    // connection's events and before this one's.
+                    if policies.publish_resume
+                        && event_tx
+                            .send(PublishOp::Resume {
+                                relay,
+                                reason: ResumeReason::NoSavedCursor,
+                            })
+                            .await
+                            .is_err()
+                    {
+                        debug!("decoder: downstream channel closed");
+                        break;
+                    }
+                    continue;
+                }
+            };
             stats.frames_in += 1;
 
             // Phase 8.5 review finding 3.5: `catch_unwind` stops
@@ -979,7 +1081,19 @@ pub fn spawn(
                     }
                     stats.events_out += 1;
                 }
-                DecodedFrame::Skipped { kind, seq } => {
+                DecodedFrame::Sync { event, seq } if policies.publish_sync => {
+                    if event_tx
+                        .send(PublishOp::Publish(Event::Sync(event), seq))
+                        .await
+                        .is_err()
+                    {
+                        debug!("decoder: downstream channel closed");
+                        break;
+                    }
+                    stats.events_out += 1;
+                }
+                DecodedFrame::Sync { seq, .. } => {
+                    let kind = "#sync";
                     stats.skipped_frames += 1;
                     metrics.skipped_frames_total.fetch_add(1, Ordering::Relaxed);
                     // Phase 8.5 review finding 1.1: send an in-band
@@ -1006,11 +1120,13 @@ pub fn spawn(
                     stats.outdated_cursors += 1;
                     // Phase 10.5 finding 5.1: consult
                     // `cursor.on_stale_cursor`. LiveTip (the default)
-                    // logs and continues — ws_reader's next reconnect
-                    // without a `?cursor=` resume param lands us at
-                    // live tip. Exit ships the reason to the
-                    // coordinator via `policy_exit_tx` and flips the
-                    // global shutdown so the cascade drains cleanly.
+                    // logs and continues: the relay keeps streaming on
+                    // this connection from its oldest retained event
+                    // (every dial carries the cursor since 2026-10-22,
+                    // so there is no cursor-less reconnect involved).
+                    // Exit ships the reason to the coordinator via
+                    // `policy_exit_tx` and flips the global shutdown
+                    // so the cascade drains cleanly.
                     match policies.outdated_cursor_action(&relay, message.as_deref()) {
                         PolicyAction::Continue => {
                             warn!(
@@ -1019,8 +1135,23 @@ pub fn spawn(
                                 relay = %relay,
                                 message = ?message,
                                 policy = "live_tip",
-                                "relay rejected cursor as stale; resuming from live tip",
+                                "relay rejected cursor as stale; continuing from its oldest retained event",
                             );
+                            // The publisher emits the `resume` entry
+                            // ahead of the first event that actually
+                            // publishes, once it knows the seq.
+                            if policies.publish_resume
+                                && event_tx
+                                    .send(PublishOp::Resume {
+                                        relay: relay.clone(),
+                                        reason: ResumeReason::OutdatedCursor,
+                                    })
+                                    .await
+                                    .is_err()
+                            {
+                                debug!("decoder: downstream channel closed");
+                                break;
+                            }
                         }
                         PolicyAction::Exit(exit) => {
                             warn!(
@@ -1208,6 +1339,27 @@ mod tests {
         out.extend_from_slice(b"#identity");
         out.extend_from_slice(body);
         out
+    }
+
+    #[test]
+    fn sync_frame_decodes_to_sync_with_did_rev_time_and_seq() {
+        let frame = sync_frame_for_tests("did:plc:abc", Some("3kaaa"), 42);
+        match decode_frame(&frame, "ws://t").expect("decodes") {
+            DecodedFrame::Sync { event, seq } => {
+                assert_eq!(seq, 42);
+                assert_eq!(event.did, "did:plc:abc");
+                assert_eq!(event.rev, "3kaaa");
+                assert_eq!(event.time.as_deref(), Some("2026-11-03T00:00:00.000Z"));
+                assert_eq!(event.relay, "ws://t");
+            }
+            other => panic!("expected Sync, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_frame_without_rev_is_a_decode_error() {
+        let frame = sync_frame_for_tests("did:plc:abc", None, 42);
+        assert!(decode_frame(&frame, "ws://t").is_err());
     }
 
     #[test]
@@ -1587,9 +1739,15 @@ mod tests {
                 event: Event::Tombstone(_),
                 ..
             } => "tombstone",
+            // Never produced by `decode_frame` (sync has its own
+            // variant; resume is built by the publisher).
+            DecodedFrame::Event {
+                event: Event::Sync(_) | Event::Resume(_),
+                ..
+            } => "unexpected",
             DecodedFrame::OutdatedCursor { .. } => "outdated_cursor",
             DecodedFrame::Info { .. } => "info",
-            DecodedFrame::Skipped { .. } => "skipped",
+            DecodedFrame::Sync { .. } => "sync",
         }
     }
 
@@ -1705,6 +1863,8 @@ mod tests {
         DecoderPolicies {
             on_stale_cursor: stale,
             on_protocol_error: proto,
+            publish_sync: false,
+            publish_resume: false,
         }
     }
 

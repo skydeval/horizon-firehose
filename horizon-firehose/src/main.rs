@@ -460,6 +460,8 @@ pub(crate) fn emit_startup_metrics(cfg: &Config, path: &std::path::Path, custom_
         "max_stream_len": cfg.redis.max_stream_len,
         "filter_nsid_count": cfg.filter.record_types.len(),
         "tls_custom_ca_loaded": custom_ca_loaded,
+        // The `_cap` stamp every stream entry carries.
+        "cap": cfg.capabilities().to_json(),
     });
 
     info!(
@@ -571,6 +573,7 @@ async fn run_async(
         cfg.relay.clone(),
         ws_reader::WsReaderOptions {
             tls_config: tls_config.clone(),
+            mark_dials_without_cursor: cfg.publisher.publish_resume,
             ..ws_reader::WsReaderOptions::default()
         },
         cursors.clone(),
@@ -601,7 +604,8 @@ async fn run_async(
         event_tx,
         metrics.clone(),
         ws_control,
-        decoder::DecoderPolicies::from_cursor_config(&cfg.cursor),
+        decoder::DecoderPolicies::from_cursor_config(&cfg.cursor)
+            .with_stream_options(&cfg.publisher),
         shutdown_tx.clone(),
         policy_exit_tx.clone(),
     );
@@ -609,6 +613,7 @@ async fn run_async(
     let mut router_handle = router::spawn(
         router::RouterOptions {
             record_types: cfg.filter.record_types.clone(),
+            forward_opless_commits: cfg.filter.forward_opless_commits,
         },
         event_rx,
         filtered_tx,
@@ -627,6 +632,8 @@ async fn run_async(
                 policy_exit_tx,
                 shutdown_tx: shutdown_tx.clone(),
             }),
+            cap_field: cfg.capabilities().field_bytes(),
+            publish_resume: cfg.publisher.publish_resume,
             ..publisher::PublisherOptions::with_defaults(
                 cfg.redis.stream_key.clone(),
                 cfg.redis.max_stream_len,

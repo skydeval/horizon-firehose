@@ -44,7 +44,27 @@
 //! relay's published cursor is dropped and counted rather than
 //! XADDed; a long run of such drops is handled as a relay sequence
 //! reset per `on_stale_cursor`. See [`ReplayGuard`].
+//!
+//! # Resume entries (0.2.0, `publisher.publish_resume`)
+//!
+//! A `resume` entry marks a point where events were lost on one relay:
+//! the relay rejected the cursor (`OutdatedCursor` under `live_tip`), a
+//! dial went out with no saved cursor, or the replay guard rebased on a
+//! relay sequence reset. The first two arrive as in-band
+//! [`PublishOp::Resume`] markers and stay pending until the first op
+//! for that relay that moves its cursor forward (a published event or
+//! a forward skip). The entry is XADDed just before that op, with
+//! `continues_from` = its seq. Ops the replay guard drops never trigger
+//! it. The reset case is emitted at the rebase itself. A resume entry
+//! has no stream-level `seq` and does not move the cursor; the op after
+//! it does, so a crash in between repeats the resume, never loses it.
+//!
+//! # `_cap`
+//!
+//! Every entry's `data` ends with `"_cap":{…}`
+//! ([`crate::event::Capabilities`]), computed once at startup.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -58,7 +78,7 @@ use crate::backend::{BackendError, StreamBackend};
 use crate::config::{OversizePolicy, StaleCursorPolicy};
 use crate::cursor::{Cursors, cursor_key};
 use crate::decoder::PolicyExit;
-use crate::event::Event;
+use crate::event::{Capabilities, Event, ResumeEvent, ResumeReason};
 use crate::metrics::Metrics;
 
 /// In-band pipeline message — the single item type on every channel
@@ -81,6 +101,11 @@ pub enum PublishOp {
     /// they advance the firehose position but have no Redis
     /// representation.
     Skip { relay: String, seq: u64 },
+    /// Events were lost on `relay` before the ops that follow. Held
+    /// until the next op that moves the relay's cursor forward, then
+    /// published as a `resume` entry ahead of it. Only sent with
+    /// `publisher.publish_resume`.
+    Resume { relay: String, reason: ResumeReason },
 }
 
 /// Where the replay guard sends a policy exit: the same coordinator
@@ -113,6 +138,14 @@ pub struct PublisherOptions {
     /// Replay guard: where an `Exit` goes. `None` (unit tests) logs
     /// the reset and keeps dropping.
     pub policy_exit: Option<PolicyExitSink>,
+    /// `"_cap":{…}` appended to every entry's `data`
+    /// ([`Capabilities::field_bytes`]).
+    pub cap_field: Vec<u8>,
+    /// `publisher.publish_resume`: emit a `resume` entry when the
+    /// replay guard rebases on a relay sequence reset. (The other two
+    /// loss points arrive as [`PublishOp::Resume`] markers, which are
+    /// only sent when this is on.)
+    pub publish_resume: bool,
 }
 
 impl PublisherOptions {
@@ -134,6 +167,8 @@ impl PublisherOptions {
             relay_reset_after: Duration::from_secs(600),
             on_stale_cursor: StaleCursorPolicy::LiveTip,
             policy_exit: None,
+            cap_field: Capabilities::default().field_bytes(),
+            publish_resume: false,
         }
     }
 }
@@ -167,6 +202,8 @@ pub struct PublisherStats {
     /// 2026-10-22 replay guard: events not XADDed because their seq
     /// was at or below the cursor already published for their relay.
     pub replayed_dropped: u64,
+    /// `resume` entries XADDed.
+    pub resumes_published: u64,
     /// Phase 8.5 follow-up finding 4.10: true when `join`/`shutdown`
     /// surfaced a `JoinError` (the task panicked). In that case the
     /// numeric fields above are `Default` — the actual pre-panic
@@ -297,6 +334,8 @@ pub async fn run<B: StreamBackend>(
 ) -> Result<PublisherStats, PublisherError> {
     let mut stats = PublisherStats::default();
     let mut guard = ReplayGuard::default();
+    // Loss points waiting for the relay's next forward op.
+    let mut pending_resume: HashMap<String, ResumeReason> = HashMap::new();
 
     loop {
         // Drain-first policy: `biased;` with `input` checked before
@@ -330,13 +369,30 @@ pub async fn run<B: StreamBackend>(
             // writer to the in-memory cursor.
             PublishOp::Skip { relay, seq } => {
                 let before = cursors.get(&relay).await;
-                cursors.advance(&relay, seq).await;
                 if before.is_none_or(|c| seq > c) {
+                    if let Some(reason) = pending_resume.remove(&relay)
+                        && let XaddOutcome::ShuttingDown = emit_resume(
+                            backend.as_ref(),
+                            &opts,
+                            &mut stats,
+                            &mut shutdown_rx,
+                            &metrics,
+                            pending_resume_event(reason, &relay, before, seq),
+                        )
+                        .await
+                    {
+                        break;
+                    }
                     // A forward skip is progress: any replay-drop run
                     // on this relay is over.
                     guard.end_run(&relay);
                 }
+                cursors.advance(&relay, seq).await;
                 stats.skip_advances += 1;
+                continue;
+            }
+            PublishOp::Resume { relay, reason } => {
+                pending_resume.insert(relay, reason);
                 continue;
             }
         };
@@ -346,18 +402,57 @@ pub async fn run<B: StreamBackend>(
 
         // 2026-10-22 replay guard: never XADD a seq this relay has
         // already published. See `ReplayGuard`.
-        match guard.check(&cursors, &relay, seq, &opts, &metrics).await {
-            GuardVerdict::Publish => {}
+        let resume = match guard.check(&cursors, &relay, seq, &opts, &metrics).await {
+            GuardVerdict::Publish => pending_resume.remove(&relay).map(|reason| {
+                // `check` returned Publish, so the cursor is below seq
+                // (or unset) and has not moved since.
+                (reason, None)
+            }),
+            GuardVerdict::PublishAfterReset {
+                saved_cursor,
+                first_lost_seq,
+            } => {
+                // The reset supersedes any marker still pending.
+                pending_resume.remove(&relay);
+                opts.publish_resume.then_some((
+                    ResumeReason::RelaySeqReset,
+                    Some((saved_cursor, first_lost_seq)),
+                ))
+            }
             GuardVerdict::Drop => {
                 stats.replayed_dropped += 1;
                 continue;
+            }
+        };
+        if let Some((reason, reset)) = resume {
+            let ev = match reset {
+                Some((saved, first_lost)) => Some(ResumeEvent {
+                    reason,
+                    saved_cursor: Some(saved),
+                    first_lost_seq: Some(first_lost),
+                    continues_from: seq,
+                    relay: relay.clone(),
+                }),
+                None => pending_resume_event(reason, &relay, cursors.get(&relay).await, seq),
+            };
+            if let XaddOutcome::ShuttingDown = emit_resume(
+                backend.as_ref(),
+                &opts,
+                &mut stats,
+                &mut shutdown_rx,
+                &metrics,
+                ev,
+            )
+            .await
+            {
+                break;
             }
         }
 
         // Serialise once: we need both the size check and the bytes we
         // eventually hand to XADD.
         let event_type = event.type_name();
-        let data = match event.to_json_bytes() {
+        let data = match event.to_json_bytes_with_cap(&opts.cap_field) {
             Ok(bytes) => bytes,
             Err(source) => {
                 // Serialisation *shouldn't* ever fail — our JSON types
@@ -426,7 +521,7 @@ pub async fn run<B: StreamBackend>(
             &mut stats,
             event_type,
             &data,
-            seq,
+            Some(seq),
             &mut shutdown_rx,
             &metrics,
         )
@@ -449,10 +544,103 @@ pub async fn run<B: StreamBackend>(
     Ok(stats)
 }
 
+/// The `resume` entry for a pending marker, given the relay's cursor
+/// just before the op at `continues_from`. `None` when nothing was
+/// lost: the op is the very next seq after the cursor.
+fn pending_resume_event(
+    reason: ResumeReason,
+    relay: &str,
+    saved_cursor: Option<u64>,
+    continues_from: u64,
+) -> Option<ResumeEvent> {
+    if let Some(c) = saved_cursor
+        && continues_from == c.saturating_add(1)
+    {
+        debug!(
+            relay = %relay,
+            ?reason,
+            cursor = c,
+            continues_from,
+            "resume marker with no gap; not publishing a resume entry"
+        );
+        return None;
+    }
+    Some(ResumeEvent {
+        reason,
+        saved_cursor,
+        first_lost_seq: saved_cursor.map(|c| c.saturating_add(1)),
+        continues_from,
+        relay: relay.to_string(),
+    })
+}
+
+/// XADD one `resume` entry (no stream-level `seq`, cursor untouched).
+/// `None` is a no-op.
+async fn emit_resume<B: StreamBackend>(
+    backend: &B,
+    opts: &PublisherOptions,
+    stats: &mut PublisherStats,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    metrics: &Metrics,
+    resume: Option<ResumeEvent>,
+) -> XaddOutcome {
+    let Some(resume) = resume else {
+        return XaddOutcome::Ok;
+    };
+    let (reason, saved, first_lost, continues_from) = (
+        resume.reason,
+        resume.saved_cursor,
+        resume.first_lost_seq,
+        resume.continues_from,
+    );
+    let relay = resume.relay.clone();
+    let event = Event::Resume(resume);
+    let data = match event.to_json_bytes_with_cap(&opts.cap_field) {
+        Ok(d) => d,
+        Err(e) => {
+            // Plain structs; cannot fail in practice. Not worth
+            // stopping the pipeline over.
+            error!(error = %e, "resume entry serialization failed; not published");
+            return XaddOutcome::Ok;
+        }
+    };
+    let outcome = xadd_with_retry(
+        backend,
+        opts,
+        stats,
+        event.type_name(),
+        &data,
+        None,
+        shutdown_rx,
+        metrics,
+    )
+    .await;
+    if let XaddOutcome::Ok = outcome {
+        stats.resumes_published += 1;
+        info!(
+            target: "horizon_firehose::metrics",
+            event_type = "resume_published",
+            relay = %relay,
+            ?reason,
+            saved_cursor = ?saved,
+            first_lost_seq = ?first_lost,
+            continues_from,
+            "published resume entry for a loss point"
+        );
+    }
+    outcome
+}
+
 /// What the replay guard decided for one event.
 #[derive(Debug, PartialEq, Eq)]
 enum GuardVerdict {
     Publish,
+    /// Publish, after rebasing the cursor on a relay sequence reset
+    /// (`live_tip`). Carries the loss for the `resume` entry.
+    PublishAfterReset {
+        saved_cursor: u64,
+        first_lost_seq: u64,
+    },
     Drop,
 }
 
@@ -595,9 +783,13 @@ impl ReplayGuard {
                     "relay sequence reset suspected; accepting the relay's new numbering \
                      (cursor moves back; events dropped during the window are lost)"
                 );
+                let verdict = GuardVerdict::PublishAfterReset {
+                    saved_cursor: run.cursor,
+                    first_lost_seq: run.first_seq,
+                };
                 self.runs.remove(relay);
                 cursors.rebase(relay, seq.saturating_sub(1)).await;
-                GuardVerdict::Publish
+                verdict
             }
             StaleCursorPolicy::Exit => {
                 run.reset_handled = true;
@@ -667,7 +859,7 @@ async fn xadd_with_retry<B: StreamBackend>(
     stats: &mut PublisherStats,
     event_type: &str,
     data: &[u8],
-    seq: u64,
+    seq: Option<u64>,
     shutdown_rx: &mut watch::Receiver<bool>,
     metrics: &Metrics,
 ) -> XaddOutcome {
@@ -716,11 +908,16 @@ async fn xadd_with_retry<B: StreamBackend>(
     }
 }
 
-fn log_redis_outage(err: &BackendError, seq: u64, downtime: Duration, next_backoff: Duration) {
+fn log_redis_outage(
+    err: &BackendError,
+    seq: Option<u64>,
+    downtime: Duration,
+    next_backoff: Duration,
+) {
     warn!(
         target: "horizon_firehose::metrics",
         event_type = "redis_outage",
-        seq,
+        seq = ?seq,
         downtime_secs = downtime.as_secs_f64(),
         next_backoff_ms = next_backoff.as_millis() as u64,
         error = %err,
@@ -735,6 +932,8 @@ fn debug_repo(ev: &Event) -> String {
         Event::Account(e) => e.did.clone(),
         Event::Handle(e) => e.did.clone(),
         Event::Tombstone(e) => e.did.clone(),
+        Event::Sync(e) => e.did.clone(),
+        Event::Resume(e) => e.relay.clone(),
     }
 }
 
@@ -780,6 +979,8 @@ mod tests {
             relay_reset_after: Duration::from_secs(600),
             on_stale_cursor: StaleCursorPolicy::LiveTip,
             policy_exit: None,
+            cap_field: Capabilities::default().field_bytes(),
+            publish_resume: false,
         }
     }
 
@@ -1349,6 +1550,268 @@ mod tests {
         assert_eq!(stats.events_published, 2);
         assert_eq!(metrics.relay_seq_resets_total.load(Ordering::Relaxed), 0);
         assert_eq!(c.get(RELAY).await, Some(102));
+    }
+
+    // ─── 0.2.0: resume entries and `_cap` ─────────────────────────────
+
+    /// `(type, data, seq)` for every entry, oldest first.
+    async fn entries(b: &InMemoryBackend) -> Vec<(String, serde_json::Value, Option<String>)> {
+        b.stream_entries("firehose:events")
+            .await
+            .into_iter()
+            .map(|(_, _, fields)| {
+                let get = |k: &str| {
+                    fields
+                        .iter()
+                        .find(|(f, _)| f == k)
+                        .map(|(_, v)| String::from_utf8(v.clone()).unwrap())
+                };
+                (
+                    get("type").unwrap(),
+                    serde_json::from_str(&get("data").unwrap()).unwrap(),
+                    get("seq"),
+                )
+            })
+            .collect()
+    }
+
+    fn resume_opts() -> PublisherOptions {
+        PublisherOptions {
+            publish_resume: true,
+            cap_field: Capabilities {
+                resume: true,
+                ..Capabilities::default()
+            }
+            .field_bytes(),
+            ..opts(1000, 1 << 20, OversizePolicy::SkipWithLog)
+        }
+    }
+
+    async fn marker(tx: &mpsc::Sender<PublishOp>, reason: ResumeReason) {
+        tx.send(PublishOp::Resume {
+            relay: RELAY.into(),
+            reason,
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn outdated_cursor_resume_precedes_first_new_event_and_has_no_seq() {
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 100).await;
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(b.clone(), c.clone(), resume_opts(), rx, m());
+        marker(&tx, ResumeReason::OutdatedCursor).await;
+        send_seqs(&tx, &[500, 501]).await;
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.resumes_published, 1);
+        assert_eq!(stats.events_published, 2);
+        let got = entries(&b).await;
+        assert_eq!(got.len(), 3);
+        let (t, data, seq) = &got[0];
+        assert_eq!(t, "resume");
+        assert_eq!(seq, &None, "resume entries carry no stream-level seq");
+        assert_eq!(data["reason"], "outdated_cursor");
+        assert_eq!(data["saved_cursor"], 100);
+        assert_eq!(data["first_lost_seq"], 101);
+        assert_eq!(data["continues_from"], 500);
+        assert_eq!(data["_relay"], RELAY);
+        assert_eq!(got[1].2.as_deref(), Some("500"));
+        assert_eq!(got[2].2.as_deref(), Some("501"));
+        // The resume entry itself never moved the cursor.
+        assert_eq!(c.get(RELAY).await, Some(501));
+    }
+
+    #[tokio::test]
+    async fn resume_is_never_published_for_frames_the_replay_guard_drops() {
+        // An ordinary reconnect overlap: frames at or below the cursor
+        // after a marker are dropped, and the resume waits for the
+        // first event that really publishes.
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 100).await;
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(b.clone(), c.clone(), resume_opts(), rx, m());
+        marker(&tx, ResumeReason::OutdatedCursor).await;
+        send_seqs(&tx, &[90, 100]).await;
+        // Only drops so far; nothing is published, resume included.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(entries(&b).await.is_empty());
+        send_seqs(&tx, &[300]).await;
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.replayed_dropped, 2);
+        assert_eq!(stats.resumes_published, 1);
+        let got = entries(&b).await;
+        let types: Vec<_> = got.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(types, vec!["resume", "commit"]);
+        assert_eq!(got[0].1["continues_from"], 300);
+    }
+
+    #[tokio::test]
+    async fn no_saved_cursor_resume_has_null_bounds() {
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(b.clone(), c.clone(), resume_opts(), rx, m());
+        marker(&tx, ResumeReason::NoSavedCursor).await;
+        send_seqs(&tx, &[42]).await;
+        drop(tx);
+
+        handle.join().await.unwrap();
+        let got = entries(&b).await;
+        assert_eq!(got.len(), 2);
+        let data = &got[0].1;
+        assert_eq!(data["reason"], "no_saved_cursor");
+        assert!(data["saved_cursor"].is_null());
+        assert!(data["first_lost_seq"].is_null());
+        assert_eq!(data["continues_from"], 42);
+    }
+
+    #[tokio::test]
+    async fn resume_marker_with_no_gap_publishes_nothing_extra() {
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 100).await;
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(b.clone(), c.clone(), resume_opts(), rx, m());
+        marker(&tx, ResumeReason::NoSavedCursor).await;
+        send_seqs(&tx, &[101]).await;
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.resumes_published, 0);
+        let types: Vec<_> = entries(&b).await.into_iter().map(|(t, _, _)| t).collect();
+        assert_eq!(types, vec!["commit"]);
+    }
+
+    #[tokio::test]
+    async fn resume_is_emitted_ahead_of_a_forward_skip() {
+        // The first op past the loss can be a skip (`#sync` not
+        // published, or a fully filtered commit). It still marks where
+        // the stream continues.
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 100).await;
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(b.clone(), c.clone(), resume_opts(), rx, m());
+        marker(&tx, ResumeReason::OutdatedCursor).await;
+        tx.send(PublishOp::Skip {
+            relay: RELAY.into(),
+            seq: 200,
+        })
+        .await
+        .unwrap();
+        send_seqs(&tx, &[201]).await;
+        drop(tx);
+
+        handle.join().await.unwrap();
+        let got = entries(&b).await;
+        let types: Vec<_> = got.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(types, vec!["resume", "commit"]);
+        assert_eq!(got[0].1["continues_from"], 200);
+        assert_eq!(c.get(RELAY).await, Some(201));
+    }
+
+    #[tokio::test]
+    async fn relay_reset_publishes_resume_at_the_rebase() {
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 1_000_000).await;
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            PublisherOptions {
+                relay_reset_after: Duration::from_millis(50),
+                on_stale_cursor: StaleCursorPolicy::LiveTip,
+                ..resume_opts()
+            },
+            rx,
+            m(),
+        );
+        send_seqs(&tx, &[1, 2]).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        send_seqs(&tx, &[3, 4]).await;
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.resumes_published, 1);
+        let got = entries(&b).await;
+        let types: Vec<_> = got.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(types, vec!["resume", "commit", "commit"]);
+        let data = &got[0].1;
+        assert_eq!(data["reason"], "relay_seq_reset");
+        assert_eq!(data["saved_cursor"], 1_000_000);
+        assert_eq!(data["first_lost_seq"], 1);
+        assert_eq!(data["continues_from"], 3);
+        assert_eq!(got[0].2, None);
+    }
+
+    #[tokio::test]
+    async fn relay_reset_without_publish_resume_adds_no_entry() {
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 1_000_000).await;
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(
+            b.clone(),
+            c.clone(),
+            PublisherOptions {
+                relay_reset_after: Duration::from_millis(50),
+                on_stale_cursor: StaleCursorPolicy::LiveTip,
+                ..opts(1000, 1 << 20, OversizePolicy::SkipWithLog)
+            },
+            rx,
+            m(),
+        );
+        send_seqs(&tx, &[1]).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        send_seqs(&tx, &[2]).await;
+        drop(tx);
+
+        let stats = handle.join().await.unwrap();
+        assert_eq!(stats.resumes_published, 0);
+        let types: Vec<_> = entries(&b).await.into_iter().map(|(t, _, _)| t).collect();
+        assert_eq!(types, vec!["commit"]);
+    }
+
+    #[tokio::test]
+    async fn every_entry_carries_the_configured_cap() {
+        let b = Arc::new(InMemoryBackend::new());
+        let c = Cursors::new();
+        c.advance(RELAY, 10).await;
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn(b.clone(), c.clone(), resume_opts(), rx, m());
+        marker(&tx, ResumeReason::OutdatedCursor).await;
+        send_seqs(&tx, &[20]).await;
+        tx.send(PublishOp::Publish(
+            Event::Sync(crate::event::SyncEvent {
+                did: "did:plc:s".into(),
+                rev: "3kzzz".into(),
+                time: None,
+                relay: RELAY.into(),
+            }),
+            21,
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+
+        handle.join().await.unwrap();
+        let got = entries(&b).await;
+        let types: Vec<_> = got.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(types, vec!["resume", "commit", "sync"]);
+        for (t, data, _) in &got {
+            assert_eq!(data["_cap"], json!({"v": 1, "caps": ["resume"]}), "{t}");
+        }
+        assert_eq!(got[2].2.as_deref(), Some("21"));
+        assert_eq!(c.get(RELAY).await, Some(21));
     }
 
     #[tokio::test]

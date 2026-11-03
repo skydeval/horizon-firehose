@@ -61,6 +61,12 @@ indexer, not only the stack it was built for.
    each with its own configurable policy.
 10. **Versioned config.** The config file carries `config_version`,
     checked at startup.
+11. **A self-describing stream (0.2.0).** Every entry carries a `_cap`
+    stamp saying what the consumer publishes. Optional `sync` and
+    `resume` entries and op-less filtered commits let a downstream
+    indexer track each repo's rev chain and every loss point exactly.
+    All three are off by default, so an existing deployment's stream
+    is unchanged apart from `_cap`.
 
 ## Non-goals
 

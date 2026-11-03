@@ -48,6 +48,7 @@
 //! backoff / failover semantics are unchanged.
 
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -62,11 +63,37 @@ use crate::config::RelayConfig;
 use crate::cursor::Cursors;
 use crate::metrics::Metrics;
 
-/// One raw WebSocket frame plus the relay URL it came from. The decoder
-/// stamps each decoded event with this so the publisher (and the
-/// per-relay cursor tracker) knows which relay's sequence number
-/// advanced.
-pub type Frame = (Vec<u8>, String);
+/// One item on the ws_reader → decoder channel.
+#[derive(Debug)]
+pub enum Frame {
+    /// One raw WebSocket frame plus the relay URL it came from. The
+    /// decoder stamps each decoded event with this so the publisher
+    /// (and the per-relay cursor tracker) knows which relay's sequence
+    /// number advanced.
+    Data { bytes: Vec<u8>, relay: String },
+    /// The connection whose frames follow was dialled with no saved
+    /// cursor for `relay`, so the relay started at its live tip. Sent
+    /// ahead of that connection's first frame, and only when
+    /// [`WsReaderOptions::mark_dials_without_cursor`] is set. The
+    /// decoder turns it into a `resume` marker for the publisher.
+    DialedWithoutCursor { relay: String },
+}
+
+impl Frame {
+    /// Raw bytes of a data frame; empty for a marker.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Frame::Data { bytes, .. } => bytes,
+            Frame::DialedWithoutCursor { .. } => &[],
+        }
+    }
+
+    pub fn relay(&self) -> &str {
+        match self {
+            Frame::Data { relay, .. } | Frame::DialedWithoutCursor { relay } => relay,
+        }
+    }
+}
 
 /// Cap on the rolling reconnect-history ring buffer. At normal rates
 /// (a handful of reconnects per hour) this is wildly over-provisioned;
@@ -124,6 +151,11 @@ pub struct WsReaderOptions {
     /// through `TungsteniteConnector::with_rustls_config` so the
     /// extra CAs take effect at the TLS handshake.
     pub tls_config: Option<Arc<rustls::ClientConfig>>,
+
+    /// Send a [`Frame::DialedWithoutCursor`] marker ahead of the first
+    /// frame of any dial that went out with no saved cursor. Set from
+    /// `publisher.publish_resume`; off, the channel carries data only.
+    pub mark_dials_without_cursor: bool,
 }
 
 impl Default for WsReaderOptions {
@@ -136,6 +168,7 @@ impl Default for WsReaderOptions {
             per_recv_timeout: Duration::from_secs(60),
             max_reconnect_attempts: 5,
             tls_config: None,
+            mark_dials_without_cursor: false,
         }
     }
 }
@@ -752,12 +785,26 @@ pub(crate) async fn build_connect_url(cursors: &Cursors, relay: &str) -> String 
 /// from blacksky, at ~8 k/s each). Resolving the URL per dial makes
 /// every reconnect, internal or supervisor-driven, resume from the
 /// cursor the publisher last confirmed.
-fn connect_url_fn(cursors: Cursors, relay: String) -> proto_blue_ws::keepalive::UrlFn {
+///
+/// `dialed_without_cursor`, when given, is set on every dial that goes
+/// out with no saved cursor; the recv loop clears it and sends a
+/// [`Frame::DialedWithoutCursor`] marker ahead of the next frame.
+fn connect_url_fn(
+    cursors: Cursors,
+    relay: String,
+    dialed_without_cursor: Option<Arc<AtomicBool>>,
+) -> proto_blue_ws::keepalive::UrlFn {
     Arc::new(move || {
         let cursors = cursors.clone();
         let relay = relay.clone();
+        let flag = dialed_without_cursor.clone();
         Box::pin(async move {
             let url = build_connect_url(&cursors, &relay).await;
+            if let Some(flag) = flag
+                && url == relay
+            {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
             // Both components are userinfo-free (config.rs rejects
             // userinfo-bearing relay URLs; the cursor is numeric).
             // Sanitizer is defense-in-depth per Phase 8.5 finding 4.4.
@@ -794,6 +841,12 @@ async fn run_one_connection(
         "connecting to relay"
     );
 
+    // Set by the url_fn on a dial with no saved cursor; cleared below
+    // when the marker goes out ahead of that dial's first frame.
+    let dialed_without_cursor = opts
+        .mark_dials_without_cursor
+        .then(|| Arc::new(AtomicBool::new(false)));
+
     // The static URL is only the SDK's fallback; `with_url_fn` below
     // takes precedence on every dial, including the first.
     let mut ws = WebSocketKeepAlive::with_connector(
@@ -817,7 +870,11 @@ async fn run_one_connection(
         // unchanged.
         connector,
     )
-    .with_url_fn(connect_url_fn(cursors.clone(), relay_label.to_string()));
+    .with_url_fn(connect_url_fn(
+        cursors.clone(),
+        relay_label.to_string(),
+        dialed_without_cursor.clone(),
+    ));
 
     let connect_res = tokio::select! {
         biased;
@@ -938,6 +995,25 @@ async fn run_one_connection(
             }
         }
 
+        // A dial with no saved cursor: tell the decoder before this
+        // frame, so the `resume` marker lands in order ahead of the
+        // first event of that connection.
+        if let Some(flag) = &dialed_without_cursor
+            && flag.swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let marker = Frame::DialedWithoutCursor {
+                relay: relay_label.to_string(),
+            };
+            let sent = tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => return ConnectionOutcome::Shutdown,
+                r = frames_tx.send(marker) => r,
+            };
+            if sent.is_err() {
+                return ConnectionOutcome::DownstreamGone;
+            }
+        }
+
         let send_res = tokio::select! {
             biased;
             _ = shutdown_rx.changed() => return ConnectionOutcome::Shutdown,
@@ -955,7 +1031,7 @@ async fn run_one_connection(
                 );
                 return ConnectionOutcome::ForcedReconnect;
             }
-            r = frames_tx.send((data, relay_label.to_string())) => r,
+            r = frames_tx.send(Frame::Data { bytes: data, relay: relay_label.to_string() }) => r,
         };
         if send_res.is_err() {
             return ConnectionOutcome::DownstreamGone;
@@ -1173,6 +1249,7 @@ mod tests {
             // Tests run against plaintext ws:// mocks — no rustls
             // involvement.
             tls_config: None,
+            mark_dials_without_cursor: false,
         }
     }
 
@@ -1275,10 +1352,10 @@ mod tests {
             .await
             .expect("recv timed out")
             .expect("channel closed");
-        assert_eq!(f1.0, b"hello");
-        assert_eq!(f1.1, server.url);
-        assert_eq!(f2.0, b"world");
-        assert_eq!(f2.1, server.url);
+        assert_eq!(f1.bytes(), b"hello");
+        assert_eq!(f1.relay(), server.url);
+        assert_eq!(f2.bytes(), b"world");
+        assert_eq!(f2.relay(), server.url);
 
         let metrics = reader.metrics();
         assert_eq!(metrics.total_reconnects_since_start, 1);
@@ -1303,8 +1380,8 @@ mod tests {
             .await
             .expect("recv timed out")
             .expect("channel closed");
-        assert_eq!(frame.0, b"after-reconnect");
-        assert_eq!(frame.1, server.url);
+        assert_eq!(frame.bytes(), b"after-reconnect");
+        assert_eq!(frame.relay(), server.url);
 
         // Server should have accepted at least 2 connections.
         assert!(
@@ -1336,8 +1413,8 @@ mod tests {
             .await
             .expect("recv timed out")
             .expect("channel closed");
-        assert_eq!(frame.0, b"from-fallback");
-        assert_eq!(frame.1, fallback.url);
+        assert_eq!(frame.bytes(), b"from-fallback");
+        assert_eq!(frame.relay(), fallback.url);
 
         // Primary should have been hit at least failover_threshold times
         // before we gave up and switched.
@@ -1418,8 +1495,8 @@ mod tests {
             .await
             .expect("recv timed out")
             .expect("channel closed");
-        assert_eq!(frame.0, b"primary-recovered");
-        assert_eq!(frame.1, primary.url);
+        assert_eq!(frame.bytes(), b"primary-recovered");
+        assert_eq!(frame.relay(), primary.url);
 
         // We should have ended up back on primary.
         assert_eq!(
@@ -1604,8 +1681,8 @@ mod tests {
             .await
             .expect("never got a frame from the fallback")
             .expect("channel closed");
-        assert_eq!(frame.0, b"from-fallback");
-        assert_eq!(frame.1, fallback_url);
+        assert_eq!(frame.bytes(), b"from-fallback");
+        assert_eq!(frame.relay(), fallback_url);
 
         // Primary must be in cooldown — the Phase 8.6 `force_cooldown`
         // branch runs on any `ReconnectExhausted` outcome.
@@ -1784,8 +1861,8 @@ mod tests {
         .expect("fallback frame should arrive after primary is cooled down");
         let (frame_opt, reader) = frame;
         let frame = frame_opt.expect("channel closed before fallback frame");
-        assert_eq!(frame.0, b"from-fallback");
-        assert_eq!(frame.1, fallback_url);
+        assert_eq!(frame.bytes(), b"from-fallback");
+        assert_eq!(frame.relay(), fallback_url);
 
         let states = reader.relay_states();
         assert_eq!(states[0].url, primary_url);

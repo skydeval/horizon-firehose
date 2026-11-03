@@ -10,9 +10,11 @@ This is the contract downstream consumers can rely on.
   above the cap.
 - **Fields per entry:**
   - `type`: one of `commit`, `identity`, `account`, `handle`,
-    `tombstone`
+    `tombstone`, and with the options below, `sync` and `resume`
   - `data`: the event as a JSON string (schema below)
-  - `seq`: the frame's sequence number, as a string
+  - `seq`: the frame's sequence number, as a string. **Absent on
+    `resume` entries**, which are not firehose frames, so per-relay
+    seq tracking never sees a duplicate.
 
 At around 1,500 events per second, 500,000 entries is roughly five
 minutes of history. If your consumers can fall further behind than
@@ -24,7 +26,7 @@ shows how close the stream is to trimming events nobody has read.
 | Frame | Result |
 | --- | --- |
 | `#commit`, `#identity`, `#account`, `#handle`, `#tombstone` | Published as an event |
-| `#sync` | Known skip: no stream entry, cursor still advances, `skipped_frames` counter |
+| `#sync` | With `publisher.publish_sync`: published as a `sync` event. Otherwise a known skip: no stream entry, cursor still advances, `skipped_frames` counter |
 | `#info`, error frames (`op == -1`) | Control signals; handled by the cursor and protocol-error policies |
 | Anything else | Unknown: logged at WARN with its name, `unknown_frame_types` counter |
 
@@ -56,7 +58,65 @@ identity_event  := { "did": string, "handle": string | null, "_relay": string }
 account_event   := { "did": string, "active": boolean, "status": string | null, "_relay": string }
 handle_event    := { "did": string, "handle": string, "_relay": string }
 tombstone_event := { "did": string, "_relay": string }
+
+// publisher.publish_sync
+sync_event      := { "did": string, "rev": string, "time": string | null, "_relay": string }
+
+// publisher.publish_resume; no stream-level seq
+resume_event := {
+  "reason":         "outdated_cursor" | "no_saved_cursor" | "relay_seq_reset",
+  "saved_cursor":   integer | null,  // relay's cursor before the loss; null if none
+  "first_lost_seq": integer | null,  // first seq not published; null if unknown
+  "continues_from": integer,         // seq of the first event after the loss
+  "_relay":         string
+}
+
+// on every entry above, as the last key
+"_cap": { "v": 1, "caps": [string], "record_types": [string] }
 ```
+
+### `_cap`
+
+Every entry's `data` ends with `_cap`, which describes what this
+consumer puts on the stream:
+
+- `v`: the stamp's format version, currently 1.
+- `caps`: the optional behaviours that are on, in this order:
+  `"sync"` (`publisher.publish_sync`), `"resume"`
+  (`publisher.publish_resume`), `"oplessFiltered"`
+  (`filter.forward_opless_commits`). Empty when none are.
+- `record_types`: the filter's NSIDs, present only when the filter is
+  non-empty.
+
+Because every entry carries it, a reader can tell from any single
+entry what to expect. An entry with no `_cap` comes from a version
+before 0.2.0. A capability missing from `caps` means that behaviour is
+off.
+
+### `resume`
+
+A `resume` entry marks a point where events on one relay were not
+published. Events with seqs in `[first_lost_seq, continues_from)` are
+missing. It is published only at real loss points:
+
+| `reason` | When | `saved_cursor` / `first_lost_seq` |
+| --- | --- | --- |
+| `outdated_cursor` | The relay rejected the cursor (`OutdatedCursor`) under `on_stale_cursor = "live_tip"` and continued from its oldest retained event | The cursor, and cursor + 1 |
+| `no_saved_cursor` | A dial went out with no saved cursor, so the relay started at its live tip (first start, or failover to a relay with no cursor yet) | Usually null. Not null if events from an earlier connection were published before this dial's first event |
+| `relay_seq_reset` | The replay guard accepted a relay sequence reset under `live_tip` (see [cursors-and-relays.md](cursors-and-relays.md#relay-sequence-resets)) | The old cursor, and the first seq dropped during the reset window |
+
+The first two are held until the first event (or `#sync` / filtered
+commit) on that relay that moves its cursor forward, and published
+just before it. Frames at or below the cursor, such as the overlap
+after an ordinary reconnect, are dropped by the replay guard and never
+trigger one. If that first event is the very next seq after the
+cursor, nothing was lost and no `resume` is published.
+
+A `resume` entry does not move the cursor; the event after it does.
+After a crash between the two, the same loss is reported again on
+restart. A `no_saved_cursor` resume can also repeat while a relay is
+being redialled before anything has been published. Treat repeats as
+the same loss.
 
 Encoding rules:
 
@@ -85,7 +145,14 @@ drops the event, logs at WARN and moves the cursor past it;
 
 `filter.record_types` is a list of NSIDs such as
 `["app.bsky.feed.post"]`. Commit operations in other collections are
-dropped. An empty list publishes everything.
+dropped. An empty list publishes everything. Non-record events
+(identity, account, handle, tombstone, sync) always pass.
+
+A commit whose operations all filter out is dropped, and its seq still
+moves the cursor. With `filter.forward_opless_commits`, it is
+published instead as an ordinary `commit` entry with `"ops": []`
+(`repo`, `commit`, `rev`, `since` and `time` intact), so a consumer
+following each repo's `since` → `rev` chain sees every link.
 
 ## Metrics
 
@@ -96,7 +163,11 @@ Metrics are structured log lines under the target
 included, so new config fields cannot leak into logs by accident:
 `config_version`, `consumer_version`, `relay_primary`,
 `relay_fallbacks`, `redis_url_host` (host only, never the full URL),
-`max_stream_len`, `filter_nsid_count`, `tls_custom_ca_loaded`.
+`max_stream_len`, `filter_nsid_count`, `tls_custom_ca_loaded`, and
+`cap` (the `_cap` stamp every entry will carry).
+
+**`resume_published`** (INFO, once per `resume` entry): `relay`,
+`reason`, `saved_cursor`, `first_lost_seq`, `continues_from`.
 
 **`periodic_metrics`** (every 10 seconds):
 
